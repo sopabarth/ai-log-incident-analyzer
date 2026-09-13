@@ -1,0 +1,10 @@
+.venv
+.git
+.idea
+.env
+__pycache__
+**/__pycache__
+*.pyc
+Dockerfile
+compose.yaml
+README.md
