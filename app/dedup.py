@@ -69,6 +69,7 @@ async def create_new_incident(
     confidence: float,
     needs_human_review: bool,
     llm_latency_ms: int | None,
+    llm_retry_count: int = 0,
 ) -> Incident:
     """Insert a fresh incident row after a real LLM call."""
     now = datetime.now(timezone.utc)
@@ -84,7 +85,7 @@ async def create_new_incident(
         confidence=confidence,
         needs_human_review=needs_human_review,
         occurrence_count=1,
-        llm_retry_count=0,
+        llm_retry_count=llm_retry_count,
         llm_latency_ms=llm_latency_ms,
         first_seen_at=now,
         last_seen_at=now,

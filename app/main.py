@@ -71,10 +71,13 @@ async def analyze_incident_endpoint(
         return incident_record
 
     try:
-        analysis, latency_ms = await run_in_threadpool(
+        analysis, latency_ms, retry_count = await run_in_threadpool(
             analyze_incident, entry.service, entry.environment, normalized_text
         )
     except LLMResponseError as e:
+        # Kept as a safety net, though analyze_incident now absorbs malformed
+        # output into a fallback analysis internally - this only fires for
+        # something unexpected escaping that retry loop.
         raise HTTPException(status_code=502, detail=f"LLM returned an unusable response: {e}")
 
     incident = await create_new_incident(
@@ -90,6 +93,7 @@ async def analyze_incident_endpoint(
         confidence=analysis.confidence,
         needs_human_review=analysis.needs_human_review,
         llm_latency_ms=latency_ms,
+        llm_retry_count=retry_count,
     )
 
     return IncidentRecord(

@@ -27,7 +27,7 @@ find_active_incident()    — seen this hash in the last N minutes?
    │
    ├── yes → record_duplicate()      → bump occurrence_count, NO LLM call
    │
-   └── no  → analyze_incident()      → real Groq LLM call
+   └── no  → analyze_incident()      → real Groq LLM call (retry/fallback, see below)
              record_new_incident()   → insert new row
    │
    ▼
@@ -42,6 +42,47 @@ calls. A hit within the dedup window (default 10 minutes) just bumps a
 counter on the existing row; once the window expires, the same error
 hash is treated as a fresh incident (worth a new analysis, since a bug
 resurfacing after a real gap may have a different cause).
+
+## Retry & fallback
+
+A single bad LLM response (invalid JSON, or JSON that fails schema
+validation) or a transient Groq API hiccup shouldn't fail the whole
+request. `analyze_incident()` retries up to `LLM_MAX_ATTEMPTS` times
+(default 3), with different handling per failure type:
+
+| Failure                                                              | Behavior                                              |
+|-----------------------------------------------------------------------|--------------------------------------------------------|
+| Malformed output (bad JSON / fails `IncidentAnalysis` validation)      | Retry immediately — it's a one-off bad generation, not a timing issue |
+| Transient API error (connection drop, timeout, rate limit, 5xx)       | Retry with a short backoff (`LLM_RETRY_BACKOFF_SECONDS × attempt`) — hammering a struggling/throttled API immediately tends to make it worse |
+| Both of the above, still failing after all attempts                   | **Fall back** to a generic result instead of failing the request |
+| Non-retryable (bad/missing API key, malformed request, permission denied) | Propagate immediately — not retried, not papered over |
+
+The fallback result is deliberately not a guess:
+
+```json
+{
+  "category": "unknown",
+  "root_cause_summary": "Automated analysis failed after repeated attempts - the model did not return a usable classification for this error.",
+  "priority": "medium",
+  "priority_reasoning": "Priority could not be determined automatically; needs manual triage.",
+  "confidence": 0.0,
+  "needs_human_review": true
+}
+```
+
+`confidence: 0.0` and `needs_human_review: true` make it unmistakable that
+this wasn't a real classification, and `priority: medium` is a deliberate
+middle ground — `low` risks a genuinely serious incident being ignored,
+`critical` risks paging someone over what might just be a bad model run.
+
+Non-retryable errors (a missing/invalid `GROQ_API_KEY`, a malformed
+request, etc.) are intentionally **not** retried or hidden behind the
+fallback — retrying a guaranteed-to-fail auth error just burns time, and
+silently returning "unknown incident" for a broken deployment would mask
+an ops problem that needs to surface loudly, not get quietly classified.
+
+The response's `llm_retry_count` reflects how many attempts beyond the
+first were needed — `0` means it succeeded on the first try.
 
 ## Tech stack
 
@@ -111,6 +152,8 @@ Copy `.env.example` to `.env` and fill in:
 | `GROQ_MODEL`           | Groq model to use                                     | `openai/gpt-oss-120b`                                      |
 | `DATABASE_URL`         | Postgres connection string (asyncpg driver)           | `postgresql+asyncpg://root:root@localhost:5432/incident_analyzer` |
 | `DEDUP_WINDOW_MINUTES` | How long a repeat error is treated as a duplicate     | `10`                                                        |
+| `LLM_MAX_ATTEMPTS`     | Max attempts before falling back (see Retry & fallback) | `3`                                                        |
+| `LLM_RETRY_BACKOFF_SECONDS` | Backoff multiplier between retries on transient API errors | `0.5`                                            |
 
 Inside `compose.yaml`, `DATABASE_URL` is overridden to point at the
 `db` service hostname instead of `localhost`, since that's how containers
@@ -185,3 +228,9 @@ Basic liveness check, returns `{"status": "ok"}`.
   inserting a new one, which is what keeps the "don't call the LLM 500
   times for the same burst" property cheap to enforce with an indexed
   lookup.
+- **Retryable failures vs. non-retryable failures are handled differently**
+  — malformed output and transient API errors get retried (then a safe
+  fallback if still failing); a broken deployment (bad API key, auth
+  failure) fails loudly instead of quietly turning into an "unknown"
+  incident, since papering over a config problem would hide it from
+  whoever needs to fix it.

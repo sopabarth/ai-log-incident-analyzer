@@ -23,9 +23,27 @@ class Priority(str, Enum):
 
 # --- INPUT ---
 
+class Environment(str, Enum):
+    DEV = "dev"
+    STAGING = "staging"
+    PROD = "prod"
+
+    @classmethod
+    def _missing_(cls, value: object) -> "Environment | None":
+        """
+        Fallback used by Python's Enum (and, through it, Pydantic's enum
+        validation) whenever `value` doesn't match a member directly - lets
+        us accept common long-form aliases without touching call sites or
+        adding a separate field validator.
+        """
+        if not isinstance(value, str):
+            return None
+        aliases = {"development": cls.DEV, "production": cls.PROD}
+        return aliases.get(value.lower())
+
 class RawLogEntry(BaseModel):
     service: str
-    environment: str  # prod / staging / dev
+    environment: Environment
     timestamp: datetime
     raw_text: str = Field(..., description="Raw stack trace or error log")
 
