@@ -22,6 +22,7 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.db import Incident
+from app.schemas import ErrorCategory, Environment, Priority
 
 DEFAULT_DEDUP_WINDOW_MINUTES = 10
 
@@ -59,12 +60,12 @@ async def create_new_incident(
     session: AsyncSession,
     *,
     service: str,
-    environment: str,
+    environment: Environment,
     timestamp: datetime,
     raw_text_hash: str,
-    category: str,
+    category: ErrorCategory,
     root_cause_summary: str,
-    priority: str,
+    priority: Priority,
     priority_reasoning: str,
     confidence: float,
     needs_human_review: bool,

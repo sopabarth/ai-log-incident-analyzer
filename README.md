@@ -89,6 +89,7 @@ first were needed — `0` means it succeeded on the first try.
 - **FastAPI** + **Pydantic** — API and schema validation
 - **Groq** (`openai/gpt-oss-120b` by default) — LLM classification, JSON mode
 - **PostgreSQL 18** + **SQLAlchemy (async)** + **asyncpg** — incident storage & dedup
+- **Alembic** — schema migrations
 - **Docker Compose** — app + database, wired together
 
 ## Project structure
@@ -105,9 +106,66 @@ data/
   synthetic_logs.py   generates 40+ labeled synthetic log examples (ground truth
                        for future eval), covering all error categories across
                        Python/Java/Go/gRPC formats and prod/staging/dev
+alembic/             migration environment (env.py reuses app.db's DATABASE_URL)
+alembic/versions/    one file per migration, applied in order
 Dockerfile
-docker-compose.yml   app + Postgres, wired together
+compose.yaml         app + Postgres, wired together
 ```
+
+### Schema migrations (Alembic)
+
+The `Incident.id` primary key is a UUID (`uuid.uuid4`, generated in Python),
+not an auto-incrementing int — it doesn't leak how many incidents exist or
+their creation order, and avoids collisions if incidents are ever inserted
+from more than one place without a shared sequence.
+
+Schema is entirely Alembic-owned - the app no longer runs `create_all()`
+at startup. Inside Docker, the app container runs `alembic upgrade head`
+automatically before starting uvicorn (see `Dockerfile`). Locally:
+
+```bash
+alembic upgrade head                                  # apply migrations
+alembic revision --autogenerate -m "describe the change"   # after editing app/db.py models
+```
+
+`alembic/env.py` reads `DATABASE_URL` from the same place `app/db.py`
+does (the environment / `.env`), so there's one connection string to keep
+in sync, not two.
+
+### Enum enforcement at the database level
+
+`category`, `priority`, and `environment` are validated by Pydantic on the
+way in, but nothing stopped a value outside that set from reaching the
+database through any other path (a manual `psql` fix during an incident
+postmortem, a future script, a bug that bypasses the schema). Two
+different mechanisms close that gap, chosen per-column based on how often
+each taxonomy is expected to change:
+
+- **`environment` and `priority` are native Postgres `ENUM` types**
+  (`environment_enum`, `priority_enum`) — these lists (`dev`/`staging`/`prod`,
+  `critical`/`high`/`medium`/`low`) aren't expected to grow.
+- **`category` is a plain `VARCHAR` with a `CHECK` constraint**
+  (`ck_incidents_category`) instead — error categories are the one
+  taxonomy here likely to expand over time, and evolving a native Postgres
+  enum is real migration pain: `ALTER TYPE ... ADD VALUE` can't be used in
+  the same transaction it runs in, and renaming/removing a value isn't
+  supported at all (the type has to be recreated). A `CHECK` constraint
+  gives the same "no garbage values" guarantee at the database level and
+  is a plain `DROP CONSTRAINT` / `ADD CONSTRAINT` to change.
+
+Both were confirmed to actually reject bad data at the database layer, not
+just in the app - a raw `UPDATE ... SET environment = 'staging_v2'` and a
+raw `UPDATE ... SET category = 'made_up_category'` both fail with a
+`psql` error.
+
+One Alembic gotcha worth knowing if you touch this: `--autogenerate`
+detected the native-enum type changes on `environment`/`priority` fine,
+but silently produced **nothing** for the `category` `CHECK` constraint
+(it doesn't diff `CheckConstraint`s), and the enum-column migration it did
+generate omits the `CREATE TYPE` step entirely (`alter_column` assumes the
+Postgres type already exists). Both had to be added by hand in the
+migration file - autogenerate output should always be read, not applied
+blindly, and this is a concrete example of where it falls short.
 
 ## Running it
 

@@ -5,28 +5,22 @@ Dedup runs before the LLM call: if the same normalized error was seen
 within the dedup window, we skip the model entirely and just bump the
 existing incident's occurrence counter. No batch endpoint, no task
 decomposition beyond parsing yet - those are added in later steps.
-"""
 
-from contextlib import asynccontextmanager
+Schema is created/updated via Alembic migrations (`alembic upgrade head`),
+not at app startup - see alembic/.
+"""
 
 from fastapi import Depends, FastAPI, HTTPException
 from fastapi.concurrency import run_in_threadpool
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.db import get_session, init_db
+from app.db import get_session
 from app.dedup import find_active_incident, record_duplicate, create_new_incident
 from app.llm_client import LLMResponseError, analyze_incident
 from app.parser import compute_error_hash, normalize_raw_text
-from app.schemas import ErrorCategory, IncidentAnalysis, IncidentRecord, Priority, RawLogEntry
+from app.schemas import IncidentAnalysis, IncidentRecord, RawLogEntry
 
-
-@asynccontextmanager
-async def lifespan(app: FastAPI):
-    await init_db()
-    yield
-
-
-app = FastAPI(title="AI Log Incident Analyzer", lifespan=lifespan)
+app = FastAPI(title="AI Log Incident Analyzer")
 
 
 @app.get("/health")
@@ -54,9 +48,9 @@ async def analyze_incident_endpoint(
             timestamp=existing.timestamp,
             raw_text_hash=existing.raw_text_hash,
             analysis=IncidentAnalysis(
-                category=ErrorCategory(existing.category),
+                category=existing.category,
                 root_cause_summary=existing.root_cause_summary,
-                priority=Priority(existing.priority),
+                priority=existing.priority,
                 priority_reasoning=existing.priority_reasoning,
                 confidence=existing.confidence,
                 needs_human_review=existing.needs_human_review,
@@ -86,9 +80,9 @@ async def analyze_incident_endpoint(
         environment=entry.environment,
         timestamp=entry.timestamp,
         raw_text_hash=error_hash,
-        category=analysis.category.value,
+        category=analysis.category,
         root_cause_summary=analysis.root_cause_summary,
-        priority=analysis.priority.value,
+        priority=analysis.priority,
         priority_reasoning=analysis.priority_reasoning,
         confidence=analysis.confidence,
         needs_human_review=analysis.needs_human_review,
