@@ -27,7 +27,7 @@ find_active_incident()    — seen this hash in the last N minutes?
    │
    ├── yes → record_duplicate()      → bump occurrence_count, NO LLM call
    │
-   └── no  → analyze_incident()      → real Groq LLM call (retry/fallback, see below)
+   └── no  → analyze_incident()      → real Groq call(s) (retry/fallback, task decomposition - see below)
              record_new_incident()   → insert new row
    │
    ▼
@@ -83,6 +83,41 @@ an ops problem that needs to surface loudly, not get quietly classified.
 
 The response's `llm_retry_count` reflects how many attempts beyond the
 first were needed — `0` means it succeeded on the first try.
+
+## Task decomposition
+
+`analyze_incident()` doesn't ask one prompt to do everything. It's two
+focused Groq calls:
+
+1. **Classify** — category, root cause summary, confidence, needs_human_review
+2. **Prioritize** — given the category from step 1 plus the same
+   service/environment/error text, just the priority + reasoning
+
+Each step is retried/falls back independently, using the same mechanism
+described above.
+
+**Why priority still needs its own LLM call instead of a deterministic
+`(category, environment) → priority` lookup table** (the first, simpler
+idea): checking that against `data/synthetic_logs.py`'s own ground truth
+shows the same category in the same environment legitimately spans
+multiple priorities — e.g. `auth_failure` in `prod` is labeled `critical`,
+`high`, *and* `low` across different examples, depending entirely on the
+blast radius described in the error text ("all requests rejected" vs "one
+user locked out"). A lookup table keyed on category+environment alone
+would have regressed accuracy, not just simplified the code - so priority
+keeps reading the actual error text, just as a separate, focused call
+rather than bundled into classification.
+
+**`TASK_DECOMPOSITION` env var** (default `false`) switches between a
+single combined call that asks for everything at once - the way this
+worked before decomposition - and this two-call pipeline. Both paths
+share the exact same retry/fallback machinery; the toggle exists to let
+the two approaches be compared directly rather than deleting the simpler
+one.
+Confirmed on the same input, both approaches can disagree - one run
+returned `network_partial_failure` / `high` decomposed vs `critical` on
+the same error single-call - a concrete example of decomposition (or its
+absence) actually changing the answer, not just the code shape.
 
 ## Tech stack
 
@@ -212,6 +247,7 @@ Copy `.env.example` to `.env` and fill in:
 | `DEDUP_WINDOW_MINUTES` | How long a repeat error is treated as a duplicate     | `10`                                                        |
 | `LLM_MAX_ATTEMPTS`     | Max attempts before falling back (see Retry & fallback) | `3`                                                        |
 | `LLM_RETRY_BACKOFF_SECONDS` | Backoff multiplier between retries on transient API errors | `0.5`                                            |
+| `TASK_DECOMPOSITION`   | `true`: classify + prioritize as two calls; `false`: one combined call | `false`                                      |
 
 Inside `compose.yaml`, `DATABASE_URL` is overridden to point at the
 `db` service hostname instead of `localhost`, since that's how containers
@@ -292,3 +328,8 @@ Basic liveness check, returns `{"status": "ok"}`.
   failure) fails loudly instead of quietly turning into an "unknown"
   incident, since papering over a config problem would hide it from
   whoever needs to fix it.
+- **Priority is decomposed into its own LLM call, not a lookup table** —
+  verified against the ground-truth data first: the same category in the
+  same environment genuinely spans multiple priorities depending on blast
+  radius described in the error text, so priority keeps reading that text
+  rather than being inferred from category+environment alone.

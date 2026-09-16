@@ -54,6 +54,25 @@ class BatchAnalyzeRequest(BaseModel):
 
 
 # --- OUTPUT (LLM returns) ---
+#
+# Task decomposition: classification and prioritization are two separate
+# LLM calls (see app/llm_client.py) - ClassificationResult and
+# PriorityResult are what each step returns on its own, and IncidentAnalysis
+# below is the two merged into the single shape the rest of the app (and
+# the API response) has always used. Splitting these out, rather than one
+# call doing everything, keeps each prompt focused on one judgment.
+
+class ClassificationResult(BaseModel):
+    category: ErrorCategory
+    root_cause_summary: str = Field(..., max_length=300)
+    confidence: float = Field(..., ge=0.0, le=1.0)
+    needs_human_review: bool
+
+
+class PriorityResult(BaseModel):
+    priority: Priority
+    priority_reasoning: str = Field(..., max_length=200)
+
 
 class IncidentAnalysis(BaseModel):
     category: ErrorCategory
