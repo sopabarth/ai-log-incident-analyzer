@@ -114,10 +114,53 @@ worked before decomposition - and this two-call pipeline. Both paths
 share the exact same retry/fallback machinery; the toggle exists to let
 the two approaches be compared directly rather than deleting the simpler
 one.
-Confirmed on the same input, both approaches can disagree - one run
-returned `network_partial_failure` / `high` decomposed vs `critical` on
-the same error single-call - a concrete example of decomposition (or its
-absence) actually changing the answer, not just the code shape.
+Confirmed on the same input, both approaches can disagree - see Eval
+results below for a full head-to-head comparison, not just one example.
+
+## Eval results
+
+`eval/run_eval.py` runs every example in `data/synthetic_logs.json` (41
+hand-labeled logs) through the real pipeline - actual Groq calls, no
+mocking - and scores the output against the ground truth: category
+accuracy/precision/recall, priority exact-match plus "how far off" it was,
+and `needs_human_review` accuracy. It bypasses FastAPI/dedup/Postgres on
+purpose, since this measures model+pipeline quality, not the HTTP/DB
+plumbing.
+
+```bash
+python -m eval.run_eval                # uses the current TASK_DECOMPOSITION setting
+python -m eval.run_eval --mode both     # run every example through both pipelines, compare
+python -m eval.run_eval --limit 5       # smoke test on a subset
+python -m eval.run_eval --save          # also write raw results under eval/results/
+```
+
+Full run, both modes, all 41 examples:
+
+| Metric                          | Single-call | Decomposed |
+|----------------------------------|:-----------:|:----------:|
+| Category accuracy                | 95.1% (39/41) | **97.6%** (40/41) |
+| Priority exact-match              | 63.4%       | **75.6%**  |
+| Priority mean distance (0 = exact) | 0.37      | **0.29**   |
+| `needs_human_review` accuracy     | 97.6%       | 97.6%      |
+
+Decomposition won on both category and priority accuracy, most visibly on
+priority (75.6% vs 63.4% exact-match) - consistent with the reasoning
+above: a focused second call that only judges priority, with the category
+already fixed, outperforms asking for everything in one shot. The two
+modes disagreed on 14 of the 41 examples; category misses in both modes
+were the same genuinely ambiguous case (a log with "No indication of what
+operation or why it failed", expected `unknown`, both modes guessed
+`network_partial_failure`).
+
+This same full run also exercised the retry/fallback path for real: one
+example hit an actual `APIConnectionError`, retried per policy, and fell
+back cleanly (`unknown`/`medium`, `confidence: 0.0`) instead of crashing
+the run - and, run back-to-back at 41-82 requests, later calls visibly
+slowed down (up to ~11s vs ~700-1000ms for the first ones), consistent
+with Groq's free tier softly throttling under sustained volume before
+ever returning a hard `RateLimitError`. Neither is a bug in the eval
+script; both are exactly the kind of behavior retry/fallback exists to
+absorb.
 
 ## Tech stack
 
@@ -138,9 +181,14 @@ app/
   db.py            async SQLAlchemy engine/session + Incident table
   dedup.py         dedup window lookup + counter updates
 data/
-  synthetic_logs.py   generates 40+ labeled synthetic log examples (ground truth
-                       for future eval), covering all error categories across
-                       Python/Java/Go/gRPC formats and prod/staging/dev
+  synthetic_logs.py   generates 40+ labeled synthetic log examples (ground
+                       truth for eval/run_eval.py), covering all error
+                       categories across Python/Java/Go/gRPC formats and
+                       prod/staging/dev
+eval/
+  run_eval.py          scores the real pipeline against synthetic_logs.json -
+                        category/priority accuracy, precision/recall, see
+                        Eval results above
 alembic/             migration environment (env.py reuses app.db's DATABASE_URL)
 alembic/versions/    one file per migration, applied in order
 Dockerfile
