@@ -5,6 +5,6 @@
 __pycache__
 **/__pycache__
 *.pyc
-Dockerfile
+Dockerfile*
 compose.yaml
 README.md

@@ -1,0 +1,16 @@
+[project]
+name = "ai-log-incident-analyzer"
+version = "0.1.0"
+description = "AI-assisted log/incident analysis: turns raw error logs into structured, prioritized incidents."
+readme = "README.md"
+requires-python = ">=3.14"
+dependencies = [
+    "alembic==1.20.0",
+    "asyncpg==0.31.0",
+    "fastapi[standard]==0.141.1",
+    "groq==1.7.0",
+    "pydantic==2.13.5",
+    "python-dotenv==1.2.3",
+    "sqlalchemy[asyncio]==2.0.52",
+    "uvicorn[standard]==0.52.4",
+]

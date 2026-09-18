@@ -40,22 +40,21 @@ dict wouldn't survive a restart, and it wouldn't be shared across multiple
 worker processes — both would silently let duplicate bursts re-trigger LLM
 calls. A hit within the dedup window (default 10 minutes) just bumps a
 counter on the existing row; once the window expires, the same error
-hash is treated as a fresh incident (worth a new analysis, since a bug
-resurfacing after a real gap may have a different cause).
+hash is treated as a fresh incident.
 
 ## Retry & fallback
 
 A single bad LLM response (invalid JSON, or JSON that fails schema
 validation) or a transient Groq API hiccup shouldn't fail the whole
-request. `analyze_incident()` retries up to `LLM_MAX_ATTEMPTS` times
-(default 3), with different handling per failure type:
+request. `analyze_incident()` retries up to `LLM_MAX_ATTEMPTS` times (default 3), with different handling per failure
+type:
 
-| Failure                                                              | Behavior                                              |
-|-----------------------------------------------------------------------|--------------------------------------------------------|
-| Malformed output (bad JSON / fails `IncidentAnalysis` validation)      | Retry immediately — it's a one-off bad generation, not a timing issue |
-| Transient API error (connection drop, timeout, rate limit, 5xx)       | Retry with a short backoff (`LLM_RETRY_BACKOFF_SECONDS × attempt`) — hammering a struggling/throttled API immediately tends to make it worse |
-| Both of the above, still failing after all attempts                   | **Fall back** to a generic result instead of failing the request |
-| Non-retryable (bad/missing API key, malformed request, permission denied) | Propagate immediately — not retried, not papered over |
+| Failure                                                                   | Behavior                                                                                                                                     |
+|---------------------------------------------------------------------------|----------------------------------------------------------------------------------------------------------------------------------------------|
+| Malformed output (bad JSON / fails `IncidentAnalysis` validation)         | Retry immediately — it's a one-off bad generation, not a timing issue                                                                        |
+| Transient API error (connection drop, timeout, rate limit, 5xx)           | Retry with a short backoff (`LLM_RETRY_BACKOFF_SECONDS × attempt`) — hammering a struggling/throttled API immediately tends to make it worse |
+| Both of the above, still failing after all attempts                       | **Fall back** to a generic result instead of failing the request                                                                             |
+| Non-retryable (bad/missing API key, malformed request, permission denied) | Propagate immediately — not retried, not papered over                                                                                        |
 
 The fallback result is deliberately not a guess:
 
@@ -128,20 +127,20 @@ purpose, since this measures model+pipeline quality, not the HTTP/DB
 plumbing.
 
 ```bash
-python -m eval.run_eval                # uses the current TASK_DECOMPOSITION setting
-python -m eval.run_eval --mode both     # run every example through both pipelines, compare
-python -m eval.run_eval --limit 5       # smoke test on a subset
-python -m eval.run_eval --save          # also write raw results under eval/results/
+uv run python -m eval.run_eval          # uses the current TASK_DECOMPOSITION setting
+uv run python -m eval.run_eval --mode both # run every example through both pipelines, compare
+uv run python -m eval.run_eval --limit 5   # smoke test on a subset
+uv run python -m eval.run_eval --save      # also write raw results under eval/results/
 ```
 
 Full run, both modes, all 41 examples:
 
-| Metric                          | Single-call | Decomposed |
-|----------------------------------|:-----------:|:----------:|
-| Category accuracy                | 95.1% (39/41) | **97.6%** (40/41) |
-| Priority exact-match              | 63.4%       | **75.6%**  |
-| Priority mean distance (0 = exact) | 0.37      | **0.29**   |
-| `needs_human_review` accuracy     | 97.6%       | 97.6%      |
+| Metric                             |  Single-call  |    Decomposed     |
+|------------------------------------|:-------------:|:-----------------:|
+| Category accuracy                  | 95.1% (39/41) | **97.6%** (40/41) |
+| Priority exact-match               |     63.4%     |     **75.6%**     |
+| Priority mean distance (0 = exact) |     0.37      |     **0.29**      |
+| `needs_human_review` accuracy      |     97.6%     |       97.6%       |
 
 Decomposition won on both category and priority accuracy, most visibly on
 priority (75.6% vs 63.4% exact-match) - consistent with the reasoning
@@ -168,6 +167,7 @@ absorb.
 - **Groq** (`openai/gpt-oss-120b` by default) — LLM classification, JSON mode
 - **PostgreSQL 18** + **SQLAlchemy (async)** + **asyncpg** — incident storage & dedup
 - **Alembic** — schema migrations
+- **uv** — dependency management (`pyproject.toml` + `uv.lock`)
 - **Docker Compose** — app + database, wired together
 
 ## Project structure
@@ -191,7 +191,11 @@ eval/
                         Eval results above
 alembic/             migration environment (env.py reuses app.db's DATABASE_URL)
 alembic/versions/    one file per migration, applied in order
-Dockerfile
+pyproject.toml         dependencies (replaces requirements.txt)
+uv.lock                exact, reproducible dependency versions - commit this
+requirements.txt       same dependencies for the pip-based image (Dockerfile.pip)
+Dockerfile.uv          app image built with uv (default)
+Dockerfile.pip         equivalent app image built with pip + requirements.txt
 compose.yaml         app + Postgres, wired together
 ```
 
@@ -204,11 +208,11 @@ from more than one place without a shared sequence.
 
 Schema is entirely Alembic-owned - the app no longer runs `create_all()`
 at startup. Inside Docker, the app container runs `alembic upgrade head`
-automatically before starting uvicorn (see `Dockerfile`). Locally:
+automatically before starting the server (see `Dockerfile.uv` / `Dockerfile.pip`). Locally:
 
 ```bash
-alembic upgrade head                                  # apply migrations
-alembic revision --autogenerate -m "describe the change"   # after editing app/db.py models
+uv run alembic upgrade head                                  # apply migrations
+uv run alembic revision --autogenerate -m "describe the change"   # after editing app/db.py models
 ```
 
 `alembic/env.py` reads `DATABASE_URL` from the same place `app/db.py`
@@ -243,8 +247,8 @@ raw `UPDATE ... SET category = 'made_up_category'` both fail with a
 
 One Alembic gotcha worth knowing if you touch this: `--autogenerate`
 detected the native-enum type changes on `environment`/`priority` fine,
-but silently produced **nothing** for the `category` `CHECK` constraint
-(it doesn't diff `CheckConstraint`s), and the enum-column migration it did
+but silently produced **nothing** for the `category` `CHECK` constraint (it doesn't diff `CheckConstraint`s), and the
+enum-column migration it did
 generate omits the `CREATE TYPE` step entirely (`alter_column` assumes the
 Postgres type already exists). Both had to be added by hand in the
 migration file - autogenerate output should always be read, not applied
@@ -257,6 +261,11 @@ blindly, and this is a concrete example of where it falls short.
 ```bash
 docker compose up -d --build
 ```
+
+The app image is built from `Dockerfile.uv` (uv, following the official uv
+Docker guide). `Dockerfile.pip` is an equivalent pip-based version - to use
+it instead, change the `dockerfile:` line under `app: build:` in
+`compose.yaml`.
 
 This builds the app image and starts Postgres + the API together — the
 app waits for the database to report healthy before starting. Postgres
@@ -276,26 +285,29 @@ docker compose down -v     # also wipes the database volume
 ### Running the app locally (without Docker)
 
 Requires a Postgres instance reachable at the `DATABASE_URL` in `.env`
-(e.g. just run `docker compose up -d db` for the database only):
+(e.g. just run `docker compose up -d db` for the database only).
+Dependencies are managed with [uv](https://docs.astral.sh/uv/) - install
+it once, then:
 
 ```bash
-pip install -r requirements.txt
-uvicorn app.main:app --reload
+uv sync                                  # create/update .venv from uv.lock
+uv run alembic upgrade head              # apply migrations
+uv run uvicorn app.main:app --reload
 ```
 
 ### Configuration
 
 Copy `.env.example` to `.env` and fill in:
 
-| Variable               | Purpose                                              | Default (local)                                         |
-|------------------------|-------------------------------------------------------|-----------------------------------------------------------|
-| `GROQ_API_KEY`         | Groq API key (free tier at console.groq.com)          | —                                                           |
-| `GROQ_MODEL`           | Groq model to use                                     | `openai/gpt-oss-120b`                                      |
-| `DATABASE_URL`         | Postgres connection string (asyncpg driver)           | `postgresql+asyncpg://root:root@localhost:5432/incident_analyzer` |
-| `DEDUP_WINDOW_MINUTES` | How long a repeat error is treated as a duplicate     | `10`                                                        |
-| `LLM_MAX_ATTEMPTS`     | Max attempts before falling back (see Retry & fallback) | `3`                                                        |
-| `LLM_RETRY_BACKOFF_SECONDS` | Backoff multiplier between retries on transient API errors | `0.5`                                            |
-| `TASK_DECOMPOSITION`   | `true`: classify + prioritize as two calls; `false`: one combined call | `false`                                      |
+| Variable                    | Purpose                                                                | Default (local)                                                   |
+|-----------------------------|------------------------------------------------------------------------|-------------------------------------------------------------------|
+| `GROQ_API_KEY`              | Groq API key (free tier at console.groq.com)                           | —                                                                 |
+| `GROQ_MODEL`                | Groq model to use                                                      | `openai/gpt-oss-120b`                                             |
+| `DATABASE_URL`              | Postgres connection string (asyncpg driver)                            | `postgresql+asyncpg://root:root@localhost:5432/incident_analyzer` |
+| `DEDUP_WINDOW_MINUTES`      | How long a repeat error is treated as a duplicate                      | `10`                                                              |
+| `LLM_MAX_ATTEMPTS`          | Max attempts before falling back (see Retry & fallback)                | `3`                                                               |
+| `LLM_RETRY_BACKOFF_SECONDS` | Backoff multiplier between retries on transient API errors             | `0.5`                                                             |
+| `TASK_DECOMPOSITION`        | `true`: classify + prioritize as two calls; `false`: one combined call | `false`                                                           |
 
 Inside `compose.yaml`, `DATABASE_URL` is overridden to point at the
 `db` service hostname instead of `localhost`, since that's how containers

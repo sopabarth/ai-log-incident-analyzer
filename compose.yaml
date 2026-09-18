@@ -8,18 +8,17 @@ services:
     ports:
       - "5432:5432"
     volumes:
-      # Postgres 18+ images expect the mount at the parent dir (not
-      # /var/lib/postgresql/data) so they can manage a version-specific
-      # subdirectory - see https://github.com/docker-library/postgres/pull/1259
       - pgdata:/var/lib/postgresql
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U root -d incident_analyzer"]
+      test: [ "CMD-SHELL", "pg_isready -U root -d incident_analyzer" ]
       interval: 5s
       timeout: 3s
       retries: 5
 
   app:
-    build: .
+    build:
+      context: .
+      dockerfile: Dockerfile.uv
     depends_on:
       db:
         condition: service_healthy
