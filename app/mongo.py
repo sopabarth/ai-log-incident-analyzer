@@ -22,6 +22,7 @@ import os
 import uuid
 from typing import Literal
 
+from bson import ObjectId
 from dotenv import load_dotenv
 from fastapi import Request
 from pymongo import ASCENDING, DESCENDING, AsyncMongoClient
@@ -121,26 +122,29 @@ def get_llm_runs(request: Request) -> AsyncCollection:
     return request.app.state.llm_runs
 
 
-async def save_llm_run(
-    collection: AsyncCollection,
-    run: LLMRun,
-    *,
-    source: TraceSource,
-    incident_id: uuid.UUID | None,
-    error_hash: str,
-    service: str,
-    environment: str,
-) -> None:
+def trace_document(
+        run: LLMRun,
+        *,
+        source: TraceSource,
+        error_hash: str,
+        service: str,
+        environment: str,
+        incident_id: uuid.UUID | None = None,
+        eval_run_id: ObjectId | None = None,
+) -> dict:
     """
-    Inserts one trace document: the run itself plus the context that links
-    it back to an incident. Eval runs have no incident (incident_id=None);
-    their documents leave the field out rather than storing null, which the
-    unique incident_id index relies on (see ensure_indexes). Never raises on
-    a database error - see module docstring.
+    One llm_runs document: the run itself plus the context that links it
+    back to where it came from - an incident (API) or an eval run (eval).
+
+    Fields that don't apply are left out rather than stored as null. For
+    incident_id that matters: the unique incident_id index counts an explicit
+    null as a value, so only one eval trace could store one (see
+    ensure_indexes).
     """
-    document = {
+    return {
         "source": source,
         **({"incident_id": incident_id} if incident_id is not None else {}),
+        **({"eval_run_id": eval_run_id} if eval_run_id is not None else {}),
         "error_hash": error_hash,
         "service": service,
         "environment": environment,
@@ -148,6 +152,26 @@ async def save_llm_run(
         # (which a TTL index needs), rather than an ISO string.
         **run.model_dump(mode="python"),
     }
+
+
+async def save_llm_run(collection: AsyncCollection,
+                       run: LLMRun,
+                       *,
+                       incident_id: uuid.UUID,
+                       error_hash: str,
+                       service: str,
+                       environment: str) -> None:
+    """
+    Saves the trace of an API analysis. Never raises on a database error -
+    see module docstring. (The eval saves its traces in bulk, and does want
+    to know when that fails - see eval/results_store.py.)
+    """
+    document = trace_document(run,
+                              source="api",
+                              incident_id=incident_id,
+                              error_hash=error_hash,
+                              service=service,
+                              environment=environment)
     try:
         await collection.insert_one(document)
     except PyMongoError as e:

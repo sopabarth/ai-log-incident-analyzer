@@ -133,8 +133,13 @@ plumbing.
 uv run python -m eval.run_eval          # uses the current TASK_DECOMPOSITION setting
 uv run python -m eval.run_eval --mode both # run every example through both pipelines, compare
 uv run python -m eval.run_eval --limit 5   # smoke test on a subset
-uv run python -m eval.run_eval --save      # also write raw results under eval/results/
+uv run python -m eval.run_eval --save      # also store results + traces in MongoDB
+uv run python -m eval.run_eval --history   # past runs and the spread across them, from MongoDB
 ```
+
+Without `--save` or `--history` the eval doesn't touch MongoDB, so it still
+runs with nothing but a Groq key. How results are stored is described in
+*Eval results in MongoDB* below.
 
 Full run, both modes, all 41 examples:
 
@@ -154,7 +159,25 @@ were the same genuinely ambiguous case (a log with "No indication of what
 operation or why it failed", expected `unknown`, both modes guessed
 `network_partial_failure`).
 
-This same full run also exercised the retry/fallback path for real: one
+A second full run (2026-11-24, the first one stored in MongoDB with
+`--save`) on the same dataset and model:
+
+| Metric                             | Single-call | Decomposed |
+|------------------------------------|:-----------:|:----------:|
+| Category accuracy                  |    97.6%    | **100%**   |
+| Priority exact-match               |    58.5%    | **68.3%**  |
+| Priority mean distance (0 = exact) |    0.46     |  **0.37**  |
+| `needs_human_review` accuracy      |    100%     |   97.6%    |
+| Median latency                     |   2957 ms   |  5355 ms   |
+
+Between the two runs each metric moved by 2.4-7.3 points with no code change
+affecting the eval. That is the model's non-determinism on a 41-example
+set, and the reason `--history` reports the spread across runs rather than
+a single number. The ranking held in both runs: decomposition is better at
+priority (by about 10-12 points) and at least as good at category, at about
+twice the latency.
+
+This first full run also exercised the retry/fallback path for real: one
 example hit an actual `APIConnectionError`, retried per policy, and fell
 back cleanly (`unknown`/`medium`, `confidence: 0.0`) instead of crashing
 the run - and, run back-to-back at 41-82 requests, later calls visibly
@@ -239,9 +262,10 @@ Design decisions:
   them a retention limit: they expire after `LLM_TRACE_TTL_DAYS` (see Indexes).
 - **Non-retryable errors leave no trace.** A bad API key, for example,
   propagates as an exception and no incident is created.
-- `source` is `"api"` for now. Eval runs will be `"eval"`, so statistics can
-  tell them apart from real traffic. Eval traces have no incident, so they
-  leave `incident_id` out rather than storing `null` (see below).
+- **`source` is `"api"` or `"eval"`,** so statistics can tell eval runs
+  apart from real traffic (`/stats/llm` defaults to `api`). Eval traces have
+  no incident, so they leave `incident_id` out rather than storing `null`
+  (see Indexes), and carry `eval_run_id` instead.
 
 `AsyncMongoClient` (pymongo's own async API; Motor is deprecated) is created
 in the FastAPI lifespan, because an async client belongs to the event loop
@@ -357,6 +381,75 @@ The pipeline was checked against hand-built traces with hand-computed
 expected values (counts, rates, means, the per-status breakdown), plus
 traces that the date and source filters must exclude.
 
+### Eval results in MongoDB
+
+`--save` used to write JSON files under `eval/results/`. It now stores each
+mode's run in MongoDB (`eval/results_store.py`), as two kinds of documents:
+
+- **`eval_runs`**, one document per (invocation, mode): model, dataset
+  (file name and a SHA-256 fingerprint), `limit`, the computed metrics, and
+  every example's result **embedded** in an `examples` array.
+- **`llm_runs`**, the collection the API writes: each example's full
+  trace, with `source: "eval"` and `eval_run_id`.
+
+This is the central modelling choice in MongoDB, embed or reference, and
+the two halves go different ways:
+
+- **Example results are embedded.** They belong to exactly one eval run,
+  are always read with it, and are bounded (41 small entries, far below the
+  16 MB document limit). One read returns the whole run, with no join.
+- **Traces are referenced.** Each embedded example holds its trace's `_id`
+  (`trace_id`), and each trace holds `eval_run_id`. Traces are large, rarely
+  needed, and expire with the TTL index. `eval_runs` has no TTL, because
+  results are kept for comparison over time. After `LLM_TRACE_TTL_DAYS` a
+  `trace_id` therefore points at nothing, and the metrics and per-example
+  results remain.
+
+Other details:
+
+- **Write order, as in the API.** The eval run's `_id` is generated in Python
+  before anything is written. ObjectIds are generated client-side anyway,
+  which is what makes this possible. The traces are inserted first, with one
+  `insert_many` that returns their ids in order, and then the `eval_runs`
+  document that points at them. A failure in between leaves expiring traces
+  without a run, never a run pointing at missing traces.
+- **`batch_id`** is shared by both modes of one `--mode both` invocation, so
+  they can be paired up later.
+- **Errors are loud, unlike in the API.** Running with `--save` is an
+  explicit request to store the results. If MongoDB is down, the report is
+  still printed, followed by `MongoDB error: ...` and exit code 1.
+- **No indexes on `eval_runs`.** It grows by two small documents per eval
+  run. A collection scan over tens of documents costs nothing, while every
+  index costs something on each write.
+- **Comparable runs only.** `--history` shows the latest runs, then
+  summarizes per mode and model, with an aggregation using `$avg`,
+  `$stdDevSamp`, `$min` and `$max`, but only over complete runs (no
+  `--limit`) on the current dataset fingerprint. Editing a label changes
+  every metric, so older runs stop being comparable automatically. The
+  spread matters because a single run on 41 examples is noisy: one example
+  is 2.4 points.
+
+From the latest complete single-call eval run to the model's actual answer
+for each category miss, with `$lookup` (MongoDB's left outer join):
+
+```js
+db.eval_runs.aggregate([
+  {$match: {mode: "single", limit: null}},
+  {$sort: {created_at: -1}}, {$limit: 1},
+  {$unwind: "$examples"},
+  {$match: {$expr: {$ne: ["$examples.expected_category", "$examples.actual_category"]}}},
+  {$lookup: {from: "llm_runs", localField: "examples.trace_id", foreignField: "_id", as: "trace"}},
+  {$unwind: "$trace"},   // $lookup always yields an array, even for one match
+  {$project: {_id: 0, service: "$examples.service", expected: "$examples.expected_category",
+              got: "$examples.actual_category", raw: {$first: {$first: "$trace.steps.attempts.raw_response"}}}}
+])
+// { service: "inventory-service", expected: "unknown", got: "network_partial_failure",
+//   raw: '{"category":"network_partial_failure","root_cause_summary":"The service is retrying ...' }
+```
+
+`$lookup` joins on `_id`, so it uses the `_id` index of `llm_runs`, and no
+extra index is needed.
+
 ## Tech stack
 
 - **FastAPI** + **Pydantic** — API and schema validation
@@ -389,6 +482,7 @@ eval/
   run_eval.py          scores the real pipeline against synthetic_logs.json -
                         category/priority accuracy, precision/recall, see
                         Eval results above
+  results_store.py     --save / --history: eval_runs + eval traces in MongoDB
 alembic/             migration environment (env.py reuses app.db's DATABASE_URL)
 alembic/versions/    one file per migration, applied in order
 pyproject.toml         dependencies (replaces requirements.txt)
