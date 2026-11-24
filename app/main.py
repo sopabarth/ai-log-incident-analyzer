@@ -26,7 +26,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.db import get_session
 from app.dedup import find_active_incident, record_duplicate, create_new_incident
 from app.llm_client import LLMResponseError, analyze_incident
-from app.mongo import create_client, get_llm_runs, llm_runs_collection, save_llm_run
+from app.mongo import create_client, ensure_indexes, get_llm_runs, llm_runs_collection, save_llm_run
 from app.parser import compute_error_hash, normalize_raw_text
 from app.schemas import IncidentAnalysis, IncidentRecord, RawLogEntry
 
@@ -37,6 +37,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     # client is bound to; closed on shutdown.
     mongo_client = create_client()
     app.state.llm_runs = llm_runs_collection(mongo_client)
+    await ensure_indexes(app.state.llm_runs)
     yield
     await mongo_client.close()
 

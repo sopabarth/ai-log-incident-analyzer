@@ -236,11 +236,12 @@ Design decisions:
   changes by itself when a prompt is edited.
 - **Traces contain raw log text.** The user prompt and raw responses can
   carry secrets or personal data from a stack trace. That is a reason to give
-  them a retention limit (TTL index, next step).
+  them a retention limit: they expire after `LLM_TRACE_TTL_DAYS` (see Indexes).
 - **Non-retryable errors leave no trace.** A bad API key, for example,
   propagates as an exception and no incident is created.
 - `source` is `"api"` for now. Eval runs will be `"eval"`, so statistics can
-  tell them apart from real traffic.
+  tell them apart from real traffic. Eval traces have no incident, so they
+  leave `incident_id` out rather than storing `null` (see below).
 
 `AsyncMongoClient` (pymongo's own async API; Motor is deprecated) is created
 in the FastAPI lifespan, because an async client belongs to the event loop
@@ -262,6 +263,52 @@ use incident_analyzer
 db.llm_runs.find().sort({created_at: -1}).limit(1)
 db.llm_runs.find({fell_back: true})
 db.llm_runs.find({"steps.attempts.status": "validation_error"}, {service: 1, "steps.attempts": 1})
+```
+
+### Indexes
+
+MongoDB has no schema to migrate, so there is no Alembic counterpart here.
+Instead, `ensure_indexes()` runs at app startup and declares the indexes
+`llm_runs` should have. Creating an index that already exists with the same
+options does nothing, so it is safe on every start. It's best effort like
+the writes: if Mongo is down, the app starts anyway and the indexes are
+created on the next start.
+
+| Index                   | Keys                               | Options                                         | Serves                                      |
+|-------------------------|------------------------------------|-------------------------------------------------|---------------------------------------------|
+| `incident_id_unique`    | `incident_id`                      | unique, partial: `{incident_id: {$exists: true}}` | the trace of an incident                    |
+| `error_hash_created_at` | `error_hash` asc, `created_at` desc | -                                               | every trace of one error, newest first      |
+| `created_at_ttl`        | `created_at`                       | `expireAfterSeconds` = `LLM_TRACE_TTL_DAYS` × 86400 | automatic expiry                            |
+
+- **`incident_id` is unique.** An incident is analyzed exactly once, so a
+  second trace for one would be a bug, and the database rejects it (E11000).
+  It's *partial* because eval traces have no incident, and a plain unique
+  index would let only one document lack the value. One detail that was
+  verified with `explain()`, not assumed: the first version filtered on
+  `{incident_id: {$type: "binData"}}`, and lookups by `incident_id` were full
+  collection scans (`COLLSCAN`). The planner uses a partial index only when
+  it can prove the query falls inside the filter, and it proves that
+  `{incident_id: <uuid>}` implies `$exists: true` but not `$type`. With
+  `$exists` the same lookup is an index scan. `$exists` counts an explicit
+  `null` as present, which is why eval traces omit the field.
+- **Compound `error_hash` + `created_at`.** One index serves both the filter
+  and the sort, so Mongo reads only the matching entries, already in order
+  (`IXSCAN`, one key and one document examined for one match), instead of
+  sorting in memory.
+- **TTL.** A background monitor deletes documents older than the TTL about
+  once a minute, so expiry isn't to the second. It only works on a BSON date,
+  which is why `created_at` is stored as a `datetime`, not an ISO string.
+  `create_index()` can't change an existing index's options (it fails with
+  `IndexOptionsConflict`), so when `LLM_TRACE_TTL_DAYS` changes, the next
+  start applies the new value in place with `collMod`. Other index changes,
+  like the partial filter above, can't be done with `collMod`: drop the old
+  index once (`db.llm_runs.dropIndex("<name>")`) and restart the app.
+
+Checking that a query uses an index:
+
+```js
+db.llm_runs.find({error_hash: "<hash>"}).sort({created_at: -1}).explain("executionStats")
+// winningPlan: FETCH <- IXSCAN (error_hash_created_at), not COLLSCAN
 ```
 
 ## Tech stack
@@ -418,6 +465,7 @@ Copy `.env.example` to `.env` and fill in:
 | `TASK_DECOMPOSITION`        | `true`: classify + prioritize as two calls; `false`: one combined call | `false`                                                           |
 | `MONGO_URL`                 | MongoDB connection string (LLM call traces)                            | `mongodb://root:root@localhost:27017/`                            |
 | `MONGO_DB`                  | MongoDB database name                                                  | `incident_analyzer`                                               |
+| `LLM_TRACE_TTL_DAYS`        | How long LLM call traces are kept before MongoDB deletes them          | `30`                                                              |
 
 Inside `compose.yaml`, `DATABASE_URL` and `MONGO_URL` are overridden to
 point at the `db` and `mongo` service hostnames instead of `localhost`, since
