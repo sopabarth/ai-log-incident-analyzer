@@ -49,7 +49,14 @@ async def find_active_incident(session: AsyncSession, raw_text_hash: str) -> Inc
 
 async def record_duplicate(session: AsyncSession, incident: Incident) -> Incident:
     """Bump occurrence_count/last_seen_at on an existing incident - no LLM call."""
-    incident.occurrence_count += 1
+    # Assigning a SQL expression, not a Python int: the UPDATE becomes
+    # `SET occurrence_count = occurrence_count + 1`, so the database does the
+    # increment atomically. `incident.occurrence_count += 1` would write back
+    # the value this request read, and simultaneous duplicates - the burst
+    # dedup exists for - overwrote each other's increments (20 concurrent
+    # duplicates were counted as 3; see tests/test_dedup_integration.py).
+    # refresh() below loads the resulting value.
+    incident.occurrence_count = Incident.occurrence_count + 1
     incident.last_seen_at = datetime.now(timezone.utc)
     await session.commit()
     await session.refresh(incident)

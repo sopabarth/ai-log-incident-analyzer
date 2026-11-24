@@ -491,6 +491,7 @@ requirements.txt       same dependencies for the pip-based image (Dockerfile.pip
 Dockerfile.uv          app image built with uv (default)
 Dockerfile.pip         equivalent app image built with pip + requirements.txt
 compose.yaml         app + Postgres + MongoDB, wired together
+tests/               pytest suite - see Tests
 ```
 
 ### Schema migrations (Alembic)
@@ -611,6 +612,71 @@ Copy `.env.example` to `.env` and fill in:
 Inside `compose.yaml`, `DATABASE_URL` and `MONGO_URL` are overridden to
 point at the `db` and `mongo` service hostnames instead of `localhost`, since
 that's how containers reach each other on the compose network.
+
+## Tests
+
+```bash
+uv run pytest                     # unit tests; no network, no databases
+TEST_DATABASE_URL=postgresql+asyncpg://root:root@localhost:5432/incident_analyzer \
+MONGO_TEST_URL=mongodb://root:root@localhost:27017/ \
+uv run pytest                     # plus the Postgres and MongoDB integration tests
+```
+
+`pytest` is a dev dependency (`uv sync` installs it; the Docker image, built
+with `--no-dev`, doesn't). The suite has 91 tests:
+
+| File                          | What it covers                                                                                                         |
+|-------------------------------|------------------------------------------------------------------------------------------------------------------------|
+| `test_parser.py`              | message lines before frames, Python source snippets dropped, truncation note, cosmetic differences hashing alike      |
+| `test_schemas.py`             | environment aliases, required request fields, LLM reply limits (enums, confidence range, text lengths)                |
+| `test_llm_client.py`          | the retry policy with a scripted fake model: malformed output retried at once, API errors backed off, fallback, non-retryable errors propagated, every attempt recorded in the trace, both pipeline modes |
+| `test_llm_trace.py`           | trace totals, what goes into the stored document, prompt fingerprints                                                 |
+| `test_mongo.py`               | trace documents (eval traces omit `incident_id`), saving never failing a request                                     |
+| `test_api.py`                 | the endpoints with Postgres, the model and MongoDB faked: new incident vs duplicate, what is passed to the model, the background trace write, 400/422/503 |
+| `test_eval.py`                | eval scoring against hand-computed values                                                                              |
+| `test_dedup_integration.py`   | against a real Postgres: the dedup window (boundary, sliding, `DEDUP_WINDOW_MINUTES`), most recent row wins, concurrent duplicates all counted, the constraints rejecting bad values, migrations down to nothing and back up |
+| `test_mongo_integration.py`   | against a real MongoDB: indexes (idempotency, TTL change, uniqueness, index use), the stats pipeline, the eval store, `$lookup` |
+
+The integration tests are skipped unless `TEST_DATABASE_URL` /
+`MONGO_TEST_URL` is set. Their logic runs inside the database, so a fake
+can't check it: SQL windows and locking behavior, constraints, indexes,
+aggregation pipelines, `$lookup`. Both suites create their own throwaway
+database (Postgres: one per run, built by running the real Alembic
+migrations; MongoDB: one per test) and drop it afterwards, so they can
+safely point at the development servers.
+
+**The dedup tests found a real bug.** `record_duplicate` incremented
+`occurrence_count` in Python (`incident.occurrence_count += 1`), so the
+UPDATE wrote back `<the value this request read> + 1`. Simultaneous
+duplicates overwrote each other's increments: 20 concurrent duplicates
+were counted as 3. A burst of one error is exactly what dedup exists for.
+The fix assigns a SQL expression instead
+(`Incident.occurrence_count + 1`), which makes the UPDATE
+`SET occurrence_count = occurrence_count + 1`, an atomic increment in the
+database. It was confirmed through the running API too: 1 new request, 10
+parallel duplicates and 1 more gave `occurrence_count: 12`.
+
+A related race remains and is not fixed: two simultaneous *first*
+occurrences of an error both find no active incident, so both call the
+model and insert separate incidents. Closing it would take a lock or a
+unique constraint over (hash, window), which plain time windows don't map
+onto directly.
+
+**The tests were checked for failing as well as passing.** A script applied
+deliberate bugs one at a time and confirmed that a test failed for each:
+eight across the app and MongoDB, and five in dedup (increment back in
+Python, window measured from the first sighting, oldest row winning, window
+ignoring `DEDUP_WINDOW_MINUTES`, `last_seen_at` not bumped).
+The bugs included the real ones found while building this: the enum reaching
+the prompt, the partial index filter that blocked index use, and eval traces
+storing `incident_id: null`. That check caught a weak test. The first
+regression test for the `Environment.PROD` bug compared the value with
+`== "prod"` and passed even with the bug in place, because
+`Environment.PROD == "prod"` is `True` for a `str` enum. It now checks the type
+and the formatted string instead.
+
+Not covered: the live Groq API. The model is always faked, and the eval
+(`eval/run_eval.py`) is what exercises the real one.
 
 ## API
 
