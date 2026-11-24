@@ -21,14 +21,13 @@ from contextlib import asynccontextmanager
 from typing import AsyncIterator
 
 from fastapi import BackgroundTasks, Depends, FastAPI, HTTPException, Query
-from fastapi.concurrency import run_in_threadpool
 from pymongo.asynchronous.collection import AsyncCollection
 from pymongo.errors import PyMongoError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.db import get_session
 from app.dedup import find_active_incident, record_duplicate, create_new_incident
-from app.llm_client import LLMResponseError, analyze_incident
+from app.llm_client import ANALYSIS_TIMEOUT_SECONDS, LLMResponseError, aclose_client, analyze_incident
 from app.llm_stats import LLMStats, StatsSource, llm_stats
 from app.mongo import create_client, ensure_indexes, get_llm_runs, llm_runs_collection, save_llm_run
 from app.parser import compute_error_hash, normalize_raw_text
@@ -44,6 +43,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     await ensure_indexes(app.state.llm_runs)
     yield
     await mongo_client.close()
+    await aclose_client()
 
 
 app = FastAPI(title="AI Log Incident Analyzer", lifespan=lifespan)
@@ -110,9 +110,13 @@ async def analyze_incident_endpoint(entry: RawLogEntry,
         # .value, not the enum: since Python 3.12 an f-string renders a
         # (str, Enum) member as "Environment.PROD", which is what the prompt
         # used to receive (caught by reading a trace in llm_runs).
-        analysis, llm_run = await run_in_threadpool(
-            analyze_incident, entry.service, entry.environment.value, normalized_text
-        )
+        analysis, llm_run = await analyze_incident(entry.service, entry.environment.value, normalized_text)
+    except TimeoutError:
+        # The analysis ran out of LLM_ANALYSIS_TIMEOUT_SECONDS; the request to
+        # Groq in flight was cancelled. Nothing is stored, so a retry by the
+        # client starts over rather than hitting a half-made incident.
+        raise HTTPException(status_code=504,
+                            detail=f"LLM analysis did not finish within {ANALYSIS_TIMEOUT_SECONDS:g}s")
     except LLMResponseError as e:
         # Kept as a safety net, though analyze_incident now absorbs malformed
         # output into a fallback analysis internally - this only fires for

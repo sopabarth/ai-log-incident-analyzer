@@ -70,9 +70,9 @@ def _load_examples(limit: int | None) -> list[dict]:
     return examples[:limit] if limit else examples
 
 
-def _run_one(example: dict) -> tuple[ExampleResult, LLMRun]:
+async def _run_one(example: dict) -> tuple[ExampleResult, LLMRun]:
     normalized = normalize_raw_text(example["raw_text"])
-    analysis, llm_run = llm_client.analyze_incident(
+    analysis, llm_run = await llm_client.analyze_incident(
         example["service"], example["environment"], normalized
     )
     result = ExampleResult(
@@ -94,7 +94,7 @@ def _run_one(example: dict) -> tuple[ExampleResult, LLMRun]:
     return result, llm_run
 
 
-def _run_pipeline(examples: list[dict], mode: str) -> tuple[list[ExampleResult], list[LLMRun]]:
+async def _run_pipeline(examples: list[dict], mode: str) -> tuple[list[ExampleResult], list[LLMRun]]:
     """
     Runs every example with llm_client.TASK_DECOMPOSITION forced to `mode`
     ("single" or "decomposed"), restoring the original value afterwards.
@@ -104,6 +104,10 @@ def _run_pipeline(examples: list[dict], mode: str) -> tuple[list[ExampleResult],
 
     Returns the results and, in a parallel list, the trace of each example's
     model calls.
+
+    Examples run one at a time even though the client is async: the free
+    tier's tokens-per-minute limit would only turn a concurrent run into a
+    stream of 429s.
     """
     original = llm_client.TASK_DECOMPOSITION
     llm_client.TASK_DECOMPOSITION = mode == "decomposed"
@@ -116,7 +120,7 @@ def _run_pipeline(examples: list[dict], mode: str) -> tuple[list[ExampleResult],
                 end=" ",
                 flush=True,
             )
-            result, trace = _run_one(example)
+            result, trace = await _run_one(example)
             verdict = "OK" if result.actual_category == result.expected_category else "MISS"
             if result.fell_back:
                 verdict = "FALLBACK"
@@ -253,17 +257,17 @@ def _print_comparison(single_results: list[ExampleResult], decomposed_results: l
     print(f"{'mean latency (ms)':<28}{_mean_latency(single_results):>10.0f}{_mean_latency(decomposed_results):>13.0f}")
 
 
-def _save(batch_id: ObjectId, mode: str, examples_total: int, limit: int | None,
-          results: list[ExampleResult], traces: list[LLMRun]) -> None:
-    eval_run_id = asyncio.run(save_eval_run(batch_id=batch_id,
-                                            mode=mode,
-                                            model=llm_client.GROQ_MODEL,
-                                            dataset_path=_DATA_PATH,
-                                            examples_total=examples_total,
-                                            limit=limit,
-                                            metrics=_metrics(results),
-                                            results=results,
-                                            traces=traces))
+async def _save(batch_id: ObjectId, mode: str, examples_total: int, limit: int | None,
+                results: list[ExampleResult], traces: list[LLMRun]) -> None:
+    eval_run_id = await save_eval_run(batch_id=batch_id,
+                                      mode=mode,
+                                      model=llm_client.GROQ_MODEL,
+                                      dataset_path=_DATA_PATH,
+                                      examples_total=examples_total,
+                                      limit=limit,
+                                      metrics=_metrics(results),
+                                      results=results,
+                                      traces=traces)
     print(f"Saved {mode} run to MongoDB: eval_runs {eval_run_id}, {len(traces)} traces in llm_runs")
 
 
@@ -274,8 +278,8 @@ def _fmt_spread(row: dict, field: str) -> str:
     return f"{mean:.1%}{spread} ({low:.1%}-{high:.1%})"
 
 
-def _print_history() -> None:
-    recent, summary = asyncio.run(load_history(_DATA_PATH))
+async def _print_history() -> None:
+    recent, summary = await load_history(_DATA_PATH)
     print("=== Recent eval runs (newest first) ===")
     print(f"{'when (UTC)':<18}{'mode':<12}{'examples':>9}{'category':>10}{'priority':>10}{'median ms':>11}"
           f"{'fallbacks':>11}  dataset")
@@ -313,31 +317,40 @@ def main() -> None:
     args = parser.parse_args()
 
     try:
-        if args.history:
-            _print_history()
-            return
-
-        examples = _load_examples(args.limit)
-        examples_total = len(_load_examples(None))
-        print(f"Loaded {len(examples)} examples from {_DATA_PATH}")
-        modes = ["single", "decomposed"] if args.mode == "both" else [args.mode]
-        # One id for the whole invocation, so the two modes of a --mode both
-        # run can be paired up later.
-        batch_id = ObjectId()
-
-        runs = {mode: _run_pipeline(examples, mode) for mode in modes}
-        for mode, (results, _) in runs.items():
-            _print_report(mode, results)
-        if args.mode == "both":
-            _print_comparison(runs["single"][0], runs["decomposed"][0])
-        if args.save:
-            print()
-            for mode, (results, traces) in runs.items():
-                _save(batch_id, mode, examples_total, args.limit, results, traces)
+        # One event loop for the whole run: the Groq client's connection pool
+        # belongs to the loop it was first used in.
+        asyncio.run(_run(args))
     except PyMongoError as e:
         # The eval itself may have finished and been printed above; only
         # storing it failed. Fail loudly - --save was asked for explicitly.
         sys.exit(f"MongoDB error: {e}")
+
+
+async def _run(args: argparse.Namespace) -> None:
+    if args.history:
+        await _print_history()
+        return
+
+    examples = _load_examples(args.limit)
+    examples_total = len(_load_examples(None))
+    print(f"Loaded {len(examples)} examples from {_DATA_PATH}")
+    modes = ["single", "decomposed"] if args.mode == "both" else [args.mode]
+    # One id for the whole invocation, so the two modes of a --mode both
+    # run can be paired up later.
+    batch_id = ObjectId()
+
+    try:
+        runs = {mode: await _run_pipeline(examples, mode) for mode in modes}
+    finally:
+        await llm_client.aclose_client()
+    for mode, (results, _) in runs.items():
+        _print_report(mode, results)
+    if args.mode == "both":
+        _print_comparison(runs["single"][0], runs["decomposed"][0])
+    if args.save:
+        print()
+        for mode, (results, traces) in runs.items():
+            await _save(batch_id, mode, examples_total, args.limit, results, traces)
 
 
 if __name__ == "__main__":

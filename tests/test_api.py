@@ -56,6 +56,7 @@ class Fakes:
         self.created: list[dict] = []
         self.saved_traces: list[tuple] = []
         self.stats_error: Exception | None = None
+        self.analyze_error: Exception | None = None
         self.stats_calls: list[dict] = []
 
     async def find_active_incident(self, session, error_hash):
@@ -65,8 +66,10 @@ class Fakes:
         incident.occurrence_count += 1
         return incident
 
-    def analyze_incident(self, service, environment, normalized_text):
+    async def analyze_incident(self, service, environment, normalized_text):
         self.analyze_calls.append((service, environment, normalized_text))
+        if self.analyze_error:
+            raise self.analyze_error
         return ANALYSIS, an_llm_run()
 
     async def create_new_incident(self, session, **fields):
@@ -156,6 +159,14 @@ def test_duplicate_skips_the_model_and_leaves_no_trace(client, fakes):
     assert body["duplicate_of_id"] == str(fakes.existing.id)
     assert body["occurrence_count"] == 2
     assert fakes.analyze_calls == [] and fakes.created == [] and fakes.saved_traces == []
+
+
+def test_analysis_timeout_is_a_504_and_stores_nothing(client, fakes):
+    fakes.analyze_error = TimeoutError()
+    response = client.post("/analyze-incident", json=REQUEST)
+    assert response.status_code == 504
+    assert "did not finish" in response.json()["detail"]
+    assert fakes.created == [] and fakes.saved_traces == []
 
 
 def test_blank_raw_text_is_rejected_before_anything_runs(client, fakes):

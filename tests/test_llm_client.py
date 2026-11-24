@@ -1,9 +1,10 @@
 """
 llm_client without Groq: _run_completion (the one function that talks to
-the API) is replaced by a scripted fake, and time.sleep by a recorder, so
+the API) is replaced by a scripted fake, and asyncio.sleep by a recorder, so
 the retry policy can be checked exactly and instantly.
 """
 
+import asyncio
 import json
 
 import httpx
@@ -36,17 +37,27 @@ CLASSIFICATION = json.dumps({"category": "auth_failure", "root_cause_summary": "
 PRIORITY = json.dumps({"priority": "low", "priority_reasoning": "One user affected."})
 
 
+HANG = object()  # a reply that never comes
+
+
 class FakeModel:
     """Plays back scripted replies: a string is returned as the model's text,
-    an exception is raised as if the API call failed."""
+    an exception is raised as if the API call failed, HANG waits forever."""
 
     def __init__(self):
         self.replies: list = []
         self.calls: list[tuple[str, str]] = []
+        self.cancelled = False
 
-    def __call__(self, system_prompt: str, user_prompt: str) -> str:
+    async def __call__(self, system_prompt: str, user_prompt: str) -> str:
         self.calls.append((system_prompt, user_prompt))
         reply = self.replies.pop(0)
+        if reply is HANG:
+            try:
+                await asyncio.Event().wait()
+            except asyncio.CancelledError:
+                self.cancelled = True
+                raise
         if isinstance(reply, Exception):
             raise reply
         return reply
@@ -61,14 +72,27 @@ def model(monkeypatch) -> FakeModel:
     monkeypatch.setattr(llm, "RETRY_BACKOFF_SECONDS", 0.5)
     monkeypatch.setattr(llm, "TASK_DECOMPOSITION", False)
     monkeypatch.setattr(llm, "GROQ_MODEL", "test-model")
+    monkeypatch.setattr(llm, "ANALYSIS_TIMEOUT_SECONDS", 30)
     return fake
 
 
 @pytest.fixture
 def sleeps(monkeypatch) -> list[float]:
     recorded: list[float] = []
-    monkeypatch.setattr(llm.time, "sleep", recorded.append)
+
+    async def record(seconds: float) -> None:
+        recorded.append(seconds)
+
+    monkeypatch.setattr(llm.asyncio, "sleep", record)
     return recorded
+
+
+def test_client_leaves_retrying_to_this_module(monkeypatch):
+    # The SDK retries 429/5xx itself by default (max_retries=2), underneath
+    # the retry loop - extra requests the trace never saw.
+    monkeypatch.setenv("GROQ_API_KEY", "test-key")
+    monkeypatch.setattr(llm, "_client", None)
+    assert llm._get_client().max_retries == 0
 
 
 # --- _parse_response ---
@@ -104,14 +128,15 @@ def test_api_errors_map_to_attempt_statuses(error, status):
 
 # --- _call_with_retry ---
 
-def call(fallback=None):
+async def call(fallback=None):
     fallback = fallback or llm._fallback_classification()
-    return llm._call_with_retry("classify", "system prompt", "user prompt", ClassificationResult, fallback)
+    return await llm._call_with_retry("classify", "system prompt", "user prompt", ClassificationResult, fallback)
 
 
-def test_first_attempt_succeeds(model, sleeps):
+@pytest.mark.anyio
+async def test_first_attempt_succeeds(model, sleeps):
     model.replies = [CLASSIFICATION]
-    result, step = call()
+    result, step = await call()
 
     assert result.category is ErrorCategory.AUTH_FAILURE
     assert [a.status for a in step.attempts] == ["ok"]
@@ -124,9 +149,10 @@ def test_first_attempt_succeeds(model, sleeps):
     assert sleeps == []
 
 
-def test_malformed_output_is_retried_immediately(model, sleeps):
+@pytest.mark.anyio
+async def test_malformed_output_is_retried_immediately(model, sleeps):
     model.replies = ["not json", '{"category": "made_up"}', CLASSIFICATION]
-    result, step = call()
+    result, step = await call()
 
     assert result.category is ErrorCategory.AUTH_FAILURE
     assert [a.status for a in step.attempts] == ["invalid_json", "validation_error", "ok"]
@@ -137,9 +163,10 @@ def test_malformed_output_is_retried_immediately(model, sleeps):
     assert sleeps == []  # a bad generation is not a timing problem
 
 
-def test_transient_api_errors_back_off(model, sleeps):
+@pytest.mark.anyio
+async def test_transient_api_errors_back_off(model, sleeps):
     model.replies = [rate_limited(), APITimeoutError(request=_REQUEST), CLASSIFICATION]
-    _, step = call()
+    _, step = await call()
 
     assert [a.status for a in step.attempts] == ["rate_limited", "timeout", "ok"]
     assert step.attempts[0].raw_response is None  # no response came back
@@ -147,10 +174,11 @@ def test_transient_api_errors_back_off(model, sleeps):
     assert sleeps == [0.5, 1.0]  # backoff x attempt
 
 
-def test_exhausted_attempts_fall_back(model, sleeps):
+@pytest.mark.anyio
+async def test_exhausted_attempts_fall_back(model, sleeps):
     model.replies = [server_error(), "not json", APIConnectionError(request=_REQUEST)]
     fallback = llm._fallback_classification()
-    result, step = call(fallback)
+    result, step = await call(fallback)
 
     assert result == fallback
     assert step.fell_back
@@ -160,25 +188,28 @@ def test_exhausted_attempts_fall_back(model, sleeps):
     assert sleeps == [0.5]  # after the API error on attempt 1, not after the last attempt
 
 
-def test_non_retryable_errors_propagate(model, sleeps):
+@pytest.mark.anyio
+async def test_non_retryable_errors_propagate(model, sleeps):
     model.replies = [_status_error(AuthenticationError, 401), CLASSIFICATION]
     with pytest.raises(AuthenticationError):
-        call()
+        await call()
     assert len(model.calls) == 1
 
 
-def test_max_attempts_setting_is_honoured(model, sleeps, monkeypatch):
+@pytest.mark.anyio
+async def test_max_attempts_setting_is_honoured(model, sleeps, monkeypatch):
     monkeypatch.setattr(llm, "MAX_ATTEMPTS", 1)
     model.replies = ["not json"]
-    _, step = call()
+    _, step = await call()
     assert step.fell_back and len(step.attempts) == 1
 
 
 # --- analyze_incident ---
 
-def test_single_call_mode(model, sleeps):
+@pytest.mark.anyio
+async def test_single_call_mode(model, sleeps):
     model.replies = ["not json", ANALYSIS]
-    analysis, run = llm.analyze_incident("checkout-api", "prod", "TimeoutError: pool")
+    analysis, run = await llm.analyze_incident("checkout-api", "prod", "TimeoutError: pool")
 
     assert isinstance(analysis, IncidentAnalysis) and analysis.priority is Priority.HIGH
     assert run.mode == "single" and run.model == "test-model"
@@ -189,10 +220,11 @@ def test_single_call_mode(model, sleeps):
     assert run.steps[0].system_prompt_fingerprint == prompt_fingerprint(system_prompt)
 
 
-def test_decomposed_mode_runs_classify_then_prioritize(model, sleeps, monkeypatch):
+@pytest.mark.anyio
+async def test_decomposed_mode_runs_classify_then_prioritize(model, sleeps, monkeypatch):
     monkeypatch.setattr(llm, "TASK_DECOMPOSITION", True)
     model.replies = [CLASSIFICATION, "not json", PRIORITY]
-    analysis, run = llm.analyze_incident("auth-api", "staging", "401 Unauthorized")
+    analysis, run = await llm.analyze_incident("auth-api", "staging", "401 Unauthorized")
 
     assert run.mode == "decomposed"
     assert [s.name for s in run.steps] == ["classify", "prioritize"]
@@ -207,13 +239,34 @@ def test_decomposed_mode_runs_classify_then_prioritize(model, sleeps, monkeypatc
     assert run.steps[0].system_prompt_fingerprint != run.steps[1].system_prompt_fingerprint
 
 
-def test_decomposed_fallback_in_one_step_marks_the_run(model, sleeps, monkeypatch):
+@pytest.mark.anyio
+async def test_decomposed_fallback_in_one_step_marks_the_run(model, sleeps, monkeypatch):
     monkeypatch.setattr(llm, "TASK_DECOMPOSITION", True)
     model.replies = [CLASSIFICATION, "bad", "bad", "bad"]
-    analysis, run = llm.analyze_incident("auth-api", "prod", "401")
+    analysis, run = await llm.analyze_incident("auth-api", "prod", "401")
 
     assert run.fell_back
     assert [s.fell_back for s in run.steps] == [False, True]
     # Classification survives; only priority is the fallback's.
     assert analysis.category is ErrorCategory.AUTH_FAILURE
     assert analysis.priority is Priority.MEDIUM
+
+
+@pytest.mark.anyio
+async def test_analysis_time_limit_cancels_the_request_in_flight(model, monkeypatch):
+    monkeypatch.setattr(llm, "ANALYSIS_TIMEOUT_SECONDS", 0.05)
+    model.replies = [HANG]
+    with pytest.raises(TimeoutError):
+        await llm.analyze_incident("api", "prod", "boom")
+    # Not just abandoned: the waiting request was cancelled.
+    assert model.cancelled
+
+
+@pytest.mark.anyio
+async def test_time_limit_covers_retries_and_backoff(model, monkeypatch):
+    monkeypatch.setattr(llm, "ANALYSIS_TIMEOUT_SECONDS", 0.2)
+    monkeypatch.setattr(llm, "RETRY_BACKOFF_SECONDS", 10)  # real sleeps here
+    model.replies = [rate_limited(), CLASSIFICATION]
+    with pytest.raises(TimeoutError):
+        await llm.analyze_incident("api", "prod", "boom")
+    assert len(model.calls) == 1  # cut off during the backoff, before attempt 2

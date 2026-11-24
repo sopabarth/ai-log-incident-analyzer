@@ -49,8 +49,23 @@ rather than a callable to invoke - see its docstring for why):
 Every attempt is recorded as it happens (status, error, latency, raw model
 response), so analyze_incident() returns, next to the analysis, an LLMRun
 trace of everything that went into it - see app/llm_trace.py.
+
+The policy above is the only retry layer. The Groq SDK retries 429s, 5xx
+and connection errors on its own by default (max_retries=2), underneath
+this loop: one attempt here could be up to three HTTP requests, so a step
+made up to nine instead of LLM_MAX_ATTEMPTS, the trace showed none of the
+extra ones, and an attempt's latency hid their waits. The client is
+created with max_retries=0 to switch that off.
+
+Everything here is async (AsyncGroq, asyncio.sleep). Waiting on the model
+is pure I/O, so an analysis in flight costs a coroutine rather than a
+thread, and - unlike a thread - it can be cancelled. analyze_incident()
+uses that for an overall time limit, LLM_ANALYSIS_TIMEOUT_SECONDS: when it
+runs out, the request to Groq in flight is cancelled and TimeoutError is
+raised.
 """
 
+import asyncio
 import json
 import os
 import time
@@ -60,7 +75,7 @@ from dotenv import load_dotenv
 from groq import (
     APIConnectionError,
     APITimeoutError,
-    Groq,
+    AsyncGroq,
     InternalServerError,
     RateLimitError,
 )
@@ -75,9 +90,11 @@ GROQ_MODEL = os.getenv("GROQ_MODEL", "openai/gpt-oss-120b")
 MAX_ATTEMPTS = int(os.getenv("LLM_MAX_ATTEMPTS", 3))
 RETRY_BACKOFF_SECONDS = float(os.getenv("LLM_RETRY_BACKOFF_SECONDS", 0.5))
 TASK_DECOMPOSITION = os.getenv("TASK_DECOMPOSITION", "false").strip().lower() in ("true", "1", "yes")
+# Bounds a whole analysis - every step, attempt and backoff wait.
+ANALYSIS_TIMEOUT_SECONDS = float(os.getenv("LLM_ANALYSIS_TIMEOUT_SECONDS", 120))
 _RETRYABLE_API_ERRORS = (APIConnectionError, APITimeoutError, RateLimitError, InternalServerError)
 
-_client: Groq | None = None
+_client: AsyncGroq | None = None
 _T = TypeVar("_T", bound=BaseModel)
 
 
@@ -89,7 +106,12 @@ class LLMResponseError(Exception):
         self.status = status
 
 
-def _get_client() -> Groq:
+def _get_client() -> AsyncGroq:
+    """
+    The shared client, created on first use. Its HTTP connection pool
+    belongs to the event loop it is first used in, so use it from a single
+    loop - the server's, or one asyncio.run() for a whole script.
+    """
     global _client
     if _client is None:
         api_key = os.getenv("GROQ_API_KEY")
@@ -97,27 +119,42 @@ def _get_client() -> Groq:
             raise RuntimeError(
                 "GROQ_API_KEY is not set - copy .env.example to .env and fill it in."
             )
-        _client = Groq(api_key=api_key)
+        # max_retries=0: retries are this module's job alone (see docstring).
+        _client = AsyncGroq(api_key=api_key, max_retries=0)
     return _client
 
 
-def analyze_incident(service: str, environment: str, normalized_text: str) -> tuple[IncidentAnalysis, LLMRun]:
+async def aclose_client() -> None:
+    """Closes the client's HTTP connections; call on shutdown."""
+    global _client
+    if _client is not None:
+        await _client.close()
+        _client = None
+
+
+async def analyze_incident(service: str, environment: str, normalized_text: str) -> tuple[IncidentAnalysis, LLMRun]:
     """
     Dispatches to the decomposed or single-call pipeline per TASK_DECOMPOSITION.
     Returns the analysis and the trace of the model calls behind it; total
     latency and retry count are on the trace (run.latency_ms, run.retry_count).
+
+    Raises TimeoutError if the whole analysis takes longer than
+    ANALYSIS_TIMEOUT_SECONDS. That isn't turned into a fallback: the retry
+    policy already falls back on failures it can absorb, and this limit is
+    the backstop for when even that takes too long.
     """
-    if TASK_DECOMPOSITION:
-        return _analyze_decomposed(service, environment, normalized_text)
-    return _analyze_single_call(service, environment, normalized_text)
+    async with asyncio.timeout(ANALYSIS_TIMEOUT_SECONDS):
+        if TASK_DECOMPOSITION:
+            return await _analyze_decomposed(service, environment, normalized_text)
+        return await _analyze_single_call(service, environment, normalized_text)
 
 
-def _run_completion(system_prompt: str, user_prompt: str) -> str:
+async def _run_completion(system_prompt: str, user_prompt: str) -> str:
     """One unretried Groq round-trip, returning the model's raw text. Groq
     API exceptions (network/auth/rate-limit/...) propagate as-is."""
     client = _get_client()
 
-    response = client.chat.completions.create(
+    response = await client.chat.completions.create(
         model=GROQ_MODEL,
         messages=[
             {"role": "system", "content": system_prompt},
@@ -163,11 +200,11 @@ def _elapsed_ms(since: float) -> int:
     return int((time.monotonic() - since) * 1000)
 
 
-def _call_with_retry(step_name: str,
-                     system_prompt: str,
-                     user_prompt: str,
-                     response_model: type[_T],
-                     fallback: _T, ) -> tuple[_T, StepTrace]:
+async def _call_with_retry(step_name: str,
+                           system_prompt: str,
+                           user_prompt: str,
+                           response_model: type[_T],
+                           fallback: _T, ) -> tuple[_T, StepTrace]:
     """
     Shared retry loop for one pipeline step. Takes the plain ingredients
     for the Groq call (prompts + expected response type) and calls
@@ -187,7 +224,7 @@ def _call_with_retry(step_name: str,
         attempt_started = time.monotonic()
         content: str | None = None
         try:
-            content = _run_completion(system_prompt, user_prompt)
+            content = await _run_completion(system_prompt, user_prompt)
             result = _parse_response(content, response_model)
         except LLMResponseError as e:
             # Bad generation, not a timing issue - retry right away.
@@ -203,7 +240,7 @@ def _call_with_retry(step_name: str,
                                                error=f"{type(e).__name__}: {e}"))
             print(f"[llm_client:{step_name}] attempt {attempt}/{MAX_ATTEMPTS} failed ({status}): {e}")
             if attempt < MAX_ATTEMPTS:
-                time.sleep(RETRY_BACKOFF_SECONDS * attempt)
+                await asyncio.sleep(RETRY_BACKOFF_SECONDS * attempt)
         else:
             trace.attempts.append(AttemptTrace(n=attempt, status="ok", latency_ms=_elapsed_ms(attempt_started),
                                                raw_response=content))
@@ -251,14 +288,14 @@ Return ONLY the JSON object, no markdown fences, no commentary.
 """
 
 
-def _analyze_single_call(service: str, environment: str, normalized_text: str) -> tuple[IncidentAnalysis, LLMRun]:
+async def _analyze_single_call(service: str, environment: str, normalized_text: str) -> tuple[IncidentAnalysis, LLMRun]:
     # Same user prompt shape as _classify - both just need service/environment/error.
     user_prompt = _build_classify_user_prompt(service, environment, normalized_text)
-    analysis, step = _call_with_retry("analyze",
-                                      _SINGLE_CALL_SYSTEM_PROMPT,
-                                      user_prompt,
-                                      IncidentAnalysis,
-                                      _fallback_single_call_analysis())
+    analysis, step = await _call_with_retry("analyze",
+                                            _SINGLE_CALL_SYSTEM_PROMPT,
+                                            user_prompt,
+                                            IncidentAnalysis,
+                                            _fallback_single_call_analysis())
     return analysis, LLMRun(mode="single", model=GROQ_MODEL, steps=[step])
 
 
@@ -274,7 +311,7 @@ def _fallback_single_call_analysis() -> IncidentAnalysis:
 
 # --- Task decomposition mode (TASK_DECOMPOSITION=true) ---
 
-def _analyze_decomposed(service: str, environment: str, normalized_text: str) -> tuple[IncidentAnalysis, LLMRun]:
+async def _analyze_decomposed(service: str, environment: str, normalized_text: str) -> tuple[IncidentAnalysis, LLMRun]:
     """
     Runs the classify -> prioritize pipeline (each step independently
     retried/falls back - see module docstring) and merges the results into
@@ -283,11 +320,11 @@ def _analyze_decomposed(service: str, environment: str, normalized_text: str) ->
     Returns (analysis, trace) - the trace has one step per call, and its
     latency and retry count are summed across both.
     """
-    classification, classify_step = _classify(service, environment, normalized_text)
-    priority_result, prioritize_step = _prioritize(service,
-                                                   environment,
-                                                   normalized_text,
-                                                   classification.category)
+    classification, classify_step = await _classify(service, environment, normalized_text)
+    priority_result, prioritize_step = await _prioritize(service,
+                                                         environment,
+                                                         normalized_text,
+                                                         classification.category)
 
     analysis = IncidentAnalysis(category=classification.category,
                                 root_cause_summary=classification.root_cause_summary,
@@ -324,13 +361,13 @@ def _build_classify_user_prompt(service: str, environment: str, normalized_text:
             f"error:\n{normalized_text}")
 
 
-def _classify(service: str, environment: str, normalized_text: str) -> tuple[ClassificationResult, StepTrace]:
+async def _classify(service: str, environment: str, normalized_text: str) -> tuple[ClassificationResult, StepTrace]:
     user_prompt = _build_classify_user_prompt(service, environment, normalized_text)
-    return _call_with_retry("classify",
-                            _CLASSIFY_SYSTEM_PROMPT,
-                            user_prompt,
-                            ClassificationResult,
-                            _fallback_classification())
+    return await _call_with_retry("classify",
+                                  _CLASSIFY_SYSTEM_PROMPT,
+                                  user_prompt,
+                                  ClassificationResult,
+                                  _fallback_classification())
 
 
 def _fallback_classification() -> ClassificationResult:
@@ -371,16 +408,16 @@ def _build_prioritize_user_prompt(service: str, environment: str, normalized_tex
             f"error:\n{normalized_text}")
 
 
-def _prioritize(service: str,
-                environment: str,
-                normalized_text: str,
-                category: ErrorCategory) -> tuple[PriorityResult, StepTrace]:
+async def _prioritize(service: str,
+                      environment: str,
+                      normalized_text: str,
+                      category: ErrorCategory) -> tuple[PriorityResult, StepTrace]:
     user_prompt = _build_prioritize_user_prompt(service, environment, normalized_text, category)
-    return _call_with_retry("prioritize",
-                            _PRIORITIZE_SYSTEM_PROMPT,
-                            user_prompt,
-                            PriorityResult,
-                            _fallback_priority())
+    return await _call_with_retry("prioritize",
+                                  _PRIORITIZE_SYSTEM_PROMPT,
+                                  user_prompt,
+                                  PriorityResult,
+                                  _fallback_priority())
 
 
 def _fallback_priority() -> PriorityResult:

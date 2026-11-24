@@ -86,6 +86,47 @@ an ops problem that needs to surface loudly, not get quietly classified.
 The response's `llm_retry_count` reflects how many attempts beyond the
 first were needed — `0` means it succeeded on the first try.
 
+### One retry layer, not two
+
+The Groq SDK retries by default too: `Groq(...)` / `AsyncGroq(...)` come
+with `max_retries=2`, which re-sends requests on 429, 5xx and connection
+errors underneath the loop above. Left on, one "attempt" could be up to
+three HTTP requests, which caused three problems:
+
+- a step made up to nine requests instead of `LLM_MAX_ATTEMPTS`;
+- the trace in MongoDB showed none of the extra ones;
+- an attempt's `latency_ms` hid their waits.
+
+The client is created with `max_retries=0`, so the policy above is the only
+one. This was measured against a local server that always answers 429:
+
+| Client                                  | HTTP requests                     |
+|-----------------------------------------|-----------------------------------|
+| SDK default, one `create()`             | 3                                 |
+| `max_retries=0`, one `create()`         | 1                                 |
+| the whole retry loop, 3 attempts        | 3, and 3 attempts in the trace    |
+
+### Async calls and the overall time limit
+
+The Groq calls are async (`AsyncGroq`, with `asyncio.sleep` for backoff).
+They used to be synchronous, run through `run_in_threadpool`. That didn't
+block the event loop, but every analysis in flight held one of the thread
+pool's 40 threads, and a thread can't be cancelled. Async isn't faster
+here: the free tier's token limit allows a few analyses per minute, far
+below 40 at once. What it adds is cancellation.
+
+`LLM_ANALYSIS_TIMEOUT_SECONDS` (default 120) bounds a whole analysis: every
+step, attempt and backoff wait. When it runs out, the request to Groq in
+flight is cancelled, not just abandoned, and the endpoint answers `504`.
+Nothing is stored, so a client retry starts over cleanly. The timeout
+doesn't produce a fallback: the retry policy already falls back on failures
+it can absorb, and the time limit is the backstop for when even that takes
+too long.
+
+Not done: cancelling an analysis when the client disconnects mid-request.
+FastAPI doesn't cancel a handler on disconnect by itself, so that would
+need code watching for the disconnect.
+
 ## Task decomposition
 
 `analyze_incident()` doesn't ask one prompt to do everything. It's two
@@ -603,6 +644,7 @@ Copy `.env.example` to `.env` and fill in:
 | `DATABASE_URL`              | Postgres connection string (asyncpg driver)                            | `postgresql+asyncpg://root:root@localhost:5432/incident_analyzer` |
 | `DEDUP_WINDOW_MINUTES`      | How long a repeat error is treated as a duplicate                      | `10`                                                              |
 | `LLM_MAX_ATTEMPTS`          | Max attempts before falling back (see Retry & fallback)                | `3`                                                               |
+| `LLM_ANALYSIS_TIMEOUT_SECONDS` | Time limit for a whole analysis (all steps, attempts and waits); `504` when exceeded | `120` |
 | `LLM_RETRY_BACKOFF_SECONDS` | Backoff multiplier between retries on transient API errors             | `0.5`                                                             |
 | `TASK_DECOMPOSITION`        | `true`: classify + prioritize as two calls; `false`: one combined call | `false`                                                           |
 | `MONGO_URL`                 | MongoDB connection string (LLM call traces)                            | `mongodb://root:root@localhost:27017/`                            |
@@ -623,13 +665,13 @@ uv run pytest                     # plus the Postgres and MongoDB integration te
 ```
 
 `pytest` is a dev dependency (`uv sync` installs it; the Docker image, built
-with `--no-dev`, doesn't). The suite has 91 tests:
+with `--no-dev`, doesn't). The suite has 95 tests:
 
 | File                          | What it covers                                                                                                         |
 |-------------------------------|------------------------------------------------------------------------------------------------------------------------|
 | `test_parser.py`              | message lines before frames, Python source snippets dropped, truncation note, cosmetic differences hashing alike      |
 | `test_schemas.py`             | environment aliases, required request fields, LLM reply limits (enums, confidence range, text lengths)                |
-| `test_llm_client.py`          | the retry policy with a scripted fake model: malformed output retried at once, API errors backed off, fallback, non-retryable errors propagated, every attempt recorded in the trace, both pipeline modes |
+| `test_llm_client.py`          | the retry policy with a scripted fake model: malformed output retried at once, API errors backed off, fallback, non-retryable errors propagated, every attempt recorded in the trace, both pipeline modes, SDK retries switched off, the overall time limit cancelling the request in flight |
 | `test_llm_trace.py`           | trace totals, what goes into the stored document, prompt fingerprints                                                 |
 | `test_mongo.py`               | trace documents (eval traces omit `incident_id`), saving never failing a request                                     |
 | `test_api.py`                 | the endpoints with Postgres, the model and MongoDB faked: new incident vs duplicate, what is passed to the model, the background trace write, 400/422/503 |
