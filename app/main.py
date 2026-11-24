@@ -13,19 +13,23 @@ Each fresh analysis also leaves a trace of its model calls in MongoDB (see
 app/mongo.py). It's written as a background task, after the response has
 been sent: it adds no latency, and a failed write can't fail the request.
 Duplicates make no model call, so they leave no trace.
+
+GET /stats/llm aggregates those traces (see app/llm_stats.py).
 """
 
 from contextlib import asynccontextmanager
 from typing import AsyncIterator
 
-from fastapi import BackgroundTasks, Depends, FastAPI, HTTPException
+from fastapi import BackgroundTasks, Depends, FastAPI, HTTPException, Query
 from fastapi.concurrency import run_in_threadpool
 from pymongo.asynchronous.collection import AsyncCollection
+from pymongo.errors import PyMongoError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.db import get_session
 from app.dedup import find_active_incident, record_duplicate, create_new_incident
 from app.llm_client import LLMResponseError, analyze_incident
+from app.llm_stats import LLMStats, StatsSource, llm_stats
 from app.mongo import create_client, ensure_indexes, get_llm_runs, llm_runs_collection, save_llm_run
 from app.parser import compute_error_hash, normalize_raw_text
 from app.schemas import IncidentAnalysis, IncidentRecord, RawLogEntry
@@ -48,6 +52,21 @@ app = FastAPI(title="AI Log Incident Analyzer", lifespan=lifespan)
 @app.get("/health")
 def health() -> dict:
     return {"status": "ok"}
+
+
+@app.get("/stats/llm", response_model=LLMStats)
+async def llm_stats_endpoint(days: int = Query(7, ge=1, le=365, description="How many days back to look"),
+                             source: StatsSource = Query("api", description="api, eval, or all"),
+                             llm_runs: AsyncCollection = Depends(get_llm_runs)) -> LLMStats:
+    # Unlike saving a trace, this can't be best effort: without Mongo there
+    # is nothing to report, so the client gets a clear 503.
+    try:
+        return await llm_stats(llm_runs, days=days, source=source)
+    except PyMongoError as e:
+        # The driver's message names internal hosts and timeouts - log it,
+        # don't hand it to the client.
+        print(f"[stats] aggregation failed: {e}")
+        raise HTTPException(status_code=503, detail="LLM trace store unavailable")
 
 
 @app.post("/analyze-incident", response_model=IncidentRecord)

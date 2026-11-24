@@ -311,6 +311,52 @@ db.llm_runs.find({error_hash: "<hash>"}).sort({created_at: -1}).explain("executi
 // winningPlan: FETCH <- IXSCAN (error_hash_created_at), not COLLSCAN
 ```
 
+### Statistics (aggregation pipeline)
+
+`GET /stats/llm` (see API below) answers questions such as "how often does
+each step fail, and how" or "how slow is decomposed mode compared to single
+call" from the stored traces. MongoDB computes the answer itself, with one
+aggregation pipeline (`app/llm_stats.py`). A pipeline is a list of stages,
+each transforming the documents the previous stage produced, a bit like a
+chain of SQL clauses in an explicit order:
+
+```
+$match   created_at >= now - days, source = "api"      (WHERE; uses an index)
+   │
+$facet ──┬── overview:       $group (all runs)          → runs, fallbacks, retries, latency
+         ├── by_mode_model:  $group by {mode, model}    → the same, per mode/model
+         └── steps:          $unwind steps
+                             $unwind steps.attempts     → one document per attempt
+                             $group by {step, status}   → attempts per status
+                             $group by step             → totals, failure rate,
+                                                          statuses as {"ok": 5, ...}
+```
+
+- **`$facet`** runs three sub-pipelines over the same matched documents and
+  returns all three results in one document: one round trip instead of three
+  queries.
+- **`$match` comes first, outside `$facet`,** because stages inside `$facet`
+  never use indexes. As the first stage it uses the TTL index on `created_at`
+  as an ordinary index for the date range (`IXSCAN(created_at_ttl)` in
+  `explain`). The planner also works out which fields the rest of the
+  pipeline needs and reads only those.
+- **`$unwind` twice** makes nested data groupable. A decomposed run with 2
+  attempts at `classify` and 1 at `prioritize` becomes three documents, one
+  per attempt. In Postgres this would be a join of runs, steps and attempts
+  tables, or `jsonb_array_elements` twice.
+- **Two `$group`s in a row** first count attempts per (step, status), then
+  roll those counts up per step. `$arrayToObject` turns the collected
+  `{k, v}` pairs into a `statuses` object.
+- **`$percentile`** (MongoDB 7.0+) gives p50/p95 latency. Inside `$group` only
+  the `approximate` method is available. On small sets it returns one of the
+  actual values rather than interpolating between two. With the four real
+  traces in the example below, p50 is 954 ms, which is one of the four
+  latencies, not the midpoint of the middle two.
+
+The pipeline was checked against hand-built traces with hand-computed
+expected values (counts, rates, means, the per-status breakdown), plus
+traces that the date and source filters must exclude.
+
 ## Tech stack
 
 - **FastAPI** + **Pydantic** — API and schema validation
@@ -330,7 +376,8 @@ app/
   parser.py        raw log normalization + hashing
   llm_client.py    Groq integration
   llm_trace.py     Pydantic models for the per-analysis trace of model calls
-  mongo.py         MongoDB client + saving traces to llm_runs
+  mongo.py         MongoDB client, indexes, saving traces to llm_runs
+  llm_stats.py     aggregation pipeline behind GET /stats/llm
   db.py            async SQLAlchemy engine/session + Incident table
   dedup.py         dedup window lookup + counter updates
 data/
@@ -514,6 +561,41 @@ Response (first time this error is seen — real LLM call):
 Sending the *same* `raw_text` again within the dedup window returns
 `is_duplicate: true`, `duplicate_of_id` pointing at the original incident,
 and an incremented `occurrence_count` — without another LLM call.
+
+### `GET /stats/llm`
+
+Statistics over the LLM call traces (see *Statistics* above).
+
+| Query param | Meaning                                         | Default |
+|-------------|-------------------------------------------------|---------|
+| `days`      | how many days back to look (1-365)              | `7`     |
+| `source`    | `api` (real traffic), `eval`, or `all`          | `api`   |
+
+```json
+{
+  "since": "2026-11-17T20:50:35Z",
+  "source": "api",
+  "overview": {
+    "runs": 4, "fallbacks": 0, "fallback_rate": 0.0, "retries": 0,
+    "latency": {"mean_ms": 1090.8, "p50_ms": 954.0, "p95_ms": 1675.0, "max_ms": 1675}
+  },
+  "by_mode_model": [
+    {"mode": "decomposed", "model": "openai/gpt-oss-120b", "runs": 1, "fallback_rate": 0.0,
+     "mean_retry_count": 0.0, "latency": {"mean_ms": 1675.0, "p50_ms": 1675.0, "p95_ms": 1675.0, "max_ms": 1675}},
+    {"mode": "single", "model": "openai/gpt-oss-120b", "runs": 3, "...": "..."}
+  ],
+  "steps": [
+    {"step": "analyze", "attempts": 3, "failed": 0, "failure_rate": 0.0, "statuses": {"ok": 3}},
+    {"step": "classify", "attempts": 1, "failed": 0, "failure_rate": 0.0, "statuses": {"ok": 1}},
+    {"step": "prioritize", "attempts": 1, "failed": 0, "failure_rate": 0.0, "statuses": {"ok": 1}}
+  ]
+}
+```
+
+`overview` is `null` when no trace matches. If MongoDB is unreachable, the
+endpoint returns `503`. Unlike saving a trace, statistics can't be best
+effort, because without the store there is nothing to report. The driver's
+error (internal host names, timeouts) is logged, not returned to the client.
 
 ### `GET /health`
 
