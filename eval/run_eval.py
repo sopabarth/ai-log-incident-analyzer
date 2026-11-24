@@ -58,7 +58,7 @@ def _load_examples(limit: int | None) -> list[dict]:
 
 def _run_one(example: dict) -> ExampleResult:
     normalized = normalize_raw_text(example["raw_text"])
-    analysis, latency_ms, retry_count = llm_client.analyze_incident(
+    analysis, llm_run = llm_client.analyze_incident(
         example["service"], example["environment"], normalized
     )
     return ExampleResult(
@@ -71,8 +71,8 @@ def _run_one(example: dict) -> ExampleResult:
         expected_needs_human_review=example["expected_needs_human_review"],
         actual_needs_human_review=analysis.needs_human_review,
         confidence=analysis.confidence,
-        latency_ms=latency_ms,
-        retry_count=retry_count,
+        latency_ms=llm_run.latency_ms,
+        retry_count=llm_run.retry_count,
         notes=example.get("notes", ""),
     )
 

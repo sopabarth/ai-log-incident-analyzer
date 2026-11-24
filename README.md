@@ -32,6 +32,9 @@ find_active_incident()    — seen this hash in the last N minutes?
    │
    ▼
 IncidentRecord (JSON response)
+   │
+   ▼ (background, after the response is sent; fresh analyses only)
+save_llm_run()            — trace of every model call → MongoDB llm_runs
 ```
 
 The dedup check runs *before* the LLM call and lives in Postgres rather
@@ -161,14 +164,115 @@ ever returning a hard `RateLimitError`. Neither is a bug in the eval
 script; both are exactly the kind of behavior retry/fallback exists to
 absorb.
 
+## LLM call traces (MongoDB)
+
+The incidents table keeps only the final answer plus `llm_retry_count` and
+`llm_latency_ms`. When the model gets an incident wrong, that isn't enough
+to see why. So every fresh analysis also writes one document to the
+MongoDB collection `llm_runs`: which mode and model ran, and for each step
+the user prompt, every attempt (status, error, latency, the model's raw
+response) and the result it settled on.
+
+```json
+{
+  "source": "api",
+  "incident_id": "3f2a…",
+  "error_hash": "15f4a0cd…",
+  "service": "payments-api",
+  "environment": "prod",
+  "mode": "decomposed",
+  "model": "openai/gpt-oss-120b",
+  "created_at": "2026-11-24T19:00:00Z",
+  "steps": [
+    {
+      "name": "classify",
+      "system_prompt_fingerprint": "9c1e0b7a42d3",
+      "user_prompt": "service: payments-api\nenvironment: prod\nerror:\n…",
+      "attempts": [
+        {"n": 1, "status": "validation_error", "latency_ms": 820,
+         "error": "schema validation failed: category: Input should be …", "raw_response": "{…}"},
+        {"n": 2, "status": "ok", "latency_ms": 760, "raw_response": "{…}"}
+      ],
+      "result": {"category": "database_timeout", "confidence": 0.95, "…": "…"},
+      "fell_back": false, "latency_ms": 1580, "retry_count": 1
+    },
+    {"name": "prioritize", "…": "…"}
+  ],
+  "latency_ms": 2220, "retry_count": 1, "fell_back": false
+}
+```
+
+Attempt statuses: `ok`, `invalid_json`, `validation_error`, `rate_limited`,
+`timeout`, `connection_error`, `server_error`.
+
+**Why a second database, and why a document store.** Incidents stay in
+Postgres: they need constraints, database-level enum validation and the
+indexed dedup lookup. Traces are different data: nested and varying in
+shape (one step or two, one to three attempts each), append-only, and
+short-lived. That is a natural fit for one document per analysis.
+Postgres could hold them too, as a `JSONB` column, and for a project this
+size that would be a legitimate choice. The document store earns its place
+with a built-in TTL for expiry, schema changes that need no migrations, and
+the aggregation pipeline for querying across traces.
+
+Design decisions:
+
+- **Best effort.** A trace is diagnostics, not business data, so a Mongo
+  outage must not fail an analysis that already succeeded. The write runs as
+  a FastAPI background task after the response is sent (no added latency),
+  errors are caught and printed, and the client gives up after 2 s instead
+  of pymongo's default 30 s.
+- **Postgres first, then Mongo.** There is no transaction spanning both
+  databases. Writing the incident first means a failed trace write leaves an
+  incident without a trace, never a trace pointing at an incident that
+  doesn't exist.
+- **Only real model calls are traced.** A dedup hit calls no model, so it
+  writes no trace. A fallback does get one, since that is the case you most
+  want to inspect.
+- **The system prompt is stored as a fingerprint.** It's a short SHA-256 of
+  the prompt text, not the text itself. The system prompts are static, so
+  storing them would repeat the same few KB in every document. The
+  fingerprint still tells which prompt version produced a trace, and it
+  changes by itself when a prompt is edited.
+- **Traces contain raw log text.** The user prompt and raw responses can
+  carry secrets or personal data from a stack trace. That is a reason to give
+  them a retention limit (TTL index, next step).
+- **Non-retryable errors leave no trace.** A bad API key, for example,
+  propagates as an exception and no incident is created.
+- `source` is `"api"` for now. Eval runs will be `"eval"`, so statistics can
+  tell them apart from real traffic.
+
+`AsyncMongoClient` (pymongo's own async API; Motor is deprecated) is created
+in the FastAPI lifespan, because an async client belongs to the event loop
+it was created in. It's configured with `uuidRepresentation="standard"`:
+pymongo has no default and refuses to encode a `uuid.UUID` without one.
+
+The first trace written already paid for itself: it showed the API sending
+the model `environment: Environment.PROD` instead of `environment: prod`.
+Since Python 3.12, an f-string renders a `(str, Enum)` member by its name,
+and the endpoint passed the enum where `analyze_incident()` expects a
+string. The eval never hit this because it reads environments as plain
+strings from JSON, so its numbers weren't affected. Neither the API response
+nor the incidents table could have shown it; only the exact prompt could.
+
+Looking at traces (`docker compose exec mongo mongosh -u root -p root`):
+
+```js
+use incident_analyzer
+db.llm_runs.find().sort({created_at: -1}).limit(1)
+db.llm_runs.find({fell_back: true})
+db.llm_runs.find({"steps.attempts.status": "validation_error"}, {service: 1, "steps.attempts": 1})
+```
+
 ## Tech stack
 
 - **FastAPI** + **Pydantic** — API and schema validation
 - **Groq** (`openai/gpt-oss-120b` by default) — LLM classification, JSON mode
 - **PostgreSQL 18** + **SQLAlchemy (async)** + **asyncpg** — incident storage & dedup
 - **Alembic** — schema migrations
+- **MongoDB 8** + **pymongo** (`AsyncMongoClient`) — LLM call traces
 - **uv** — dependency management (`pyproject.toml` + `uv.lock`)
-- **Docker Compose** — app + database, wired together
+- **Docker Compose** — app + both databases, wired together
 
 ## Project structure
 
@@ -178,6 +282,8 @@ app/
   schemas.py       Pydantic models (input, LLM output, stored record)
   parser.py        raw log normalization + hashing
   llm_client.py    Groq integration
+  llm_trace.py     Pydantic models for the per-analysis trace of model calls
+  mongo.py         MongoDB client + saving traces to llm_runs
   db.py            async SQLAlchemy engine/session + Incident table
   dedup.py         dedup window lookup + counter updates
 data/
@@ -196,7 +302,7 @@ uv.lock                exact, reproducible dependency versions - commit this
 requirements.txt       same dependencies for the pip-based image (Dockerfile.pip)
 Dockerfile.uv          app image built with uv (default)
 Dockerfile.pip         equivalent app image built with pip + requirements.txt
-compose.yaml         app + Postgres, wired together
+compose.yaml         app + Postgres + MongoDB, wired together
 ```
 
 ### Schema migrations (Alembic)
@@ -267,9 +373,9 @@ Docker guide). `Dockerfile.pip` is an equivalent pip-based version - to use
 it instead, change the `dockerfile:` line under `app: build:` in
 `compose.yaml`.
 
-This builds the app image and starts Postgres + the API together — the
-app waits for the database to report healthy before starting. Postgres
-data persists in a named volume (`pgdata`) across restarts.
+This builds the app image and starts Postgres, MongoDB and the API together —
+the app waits for both databases to report healthy before starting. Data
+persists in named volumes (`pgdata`, `mongodata`) across restarts.
 
 ```bash
 curl http://localhost:8000/health
@@ -279,13 +385,15 @@ To stop:
 
 ```bash
 docker compose down        # keeps data
-docker compose down -v     # also wipes the database volume
+docker compose down -v     # also wipes the database volumes
 ```
 
 ### Running the app locally (without Docker)
 
 Requires a Postgres instance reachable at the `DATABASE_URL` in `.env`
-(e.g. just run `docker compose up -d db` for the database only).
+(e.g. just run `docker compose up -d db mongo` for the databases only).
+MongoDB is optional here: without it the app works, and only the traces are
+skipped.
 Dependencies are managed with [uv](https://docs.astral.sh/uv/) - install
 it once, then:
 
@@ -308,10 +416,12 @@ Copy `.env.example` to `.env` and fill in:
 | `LLM_MAX_ATTEMPTS`          | Max attempts before falling back (see Retry & fallback)                | `3`                                                               |
 | `LLM_RETRY_BACKOFF_SECONDS` | Backoff multiplier between retries on transient API errors             | `0.5`                                                             |
 | `TASK_DECOMPOSITION`        | `true`: classify + prioritize as two calls; `false`: one combined call | `false`                                                           |
+| `MONGO_URL`                 | MongoDB connection string (LLM call traces)                            | `mongodb://root:root@localhost:27017/`                            |
+| `MONGO_DB`                  | MongoDB database name                                                  | `incident_analyzer`                                               |
 
-Inside `compose.yaml`, `DATABASE_URL` is overridden to point at the
-`db` service hostname instead of `localhost`, since that's how containers
-reach each other on the compose network.
+Inside `compose.yaml`, `DATABASE_URL` and `MONGO_URL` are overridden to
+point at the `db` and `mongo` service hostnames instead of `localhost`, since
+that's how containers reach each other on the compose network.
 
 ## API
 

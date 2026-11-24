@@ -8,19 +8,40 @@ decomposition beyond parsing yet - those are added in later steps.
 
 Schema is created/updated via Alembic migrations (`alembic upgrade head`),
 not at app startup - see alembic/.
+
+Each fresh analysis also leaves a trace of its model calls in MongoDB (see
+app/mongo.py). It's written as a background task, after the response has
+been sent: it adds no latency, and a failed write can't fail the request.
+Duplicates make no model call, so they leave no trace.
 """
 
-from fastapi import Depends, FastAPI, HTTPException
+from contextlib import asynccontextmanager
+from typing import AsyncIterator
+
+from fastapi import BackgroundTasks, Depends, FastAPI, HTTPException
 from fastapi.concurrency import run_in_threadpool
+from pymongo.asynchronous.collection import AsyncCollection
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.db import get_session
 from app.dedup import find_active_incident, record_duplicate, create_new_incident
 from app.llm_client import LLMResponseError, analyze_incident
+from app.mongo import create_client, get_llm_runs, llm_runs_collection, save_llm_run
 from app.parser import compute_error_hash, normalize_raw_text
 from app.schemas import IncidentAnalysis, IncidentRecord, RawLogEntry
 
-app = FastAPI(title="AI Log Incident Analyzer")
+
+@asynccontextmanager
+async def lifespan(app: FastAPI) -> AsyncIterator[None]:
+    # Created here, inside the server's event loop, which an async Mongo
+    # client is bound to; closed on shutdown.
+    mongo_client = create_client()
+    app.state.llm_runs = llm_runs_collection(mongo_client)
+    yield
+    await mongo_client.close()
+
+
+app = FastAPI(title="AI Log Incident Analyzer", lifespan=lifespan)
 
 
 @app.get("/health")
@@ -29,9 +50,10 @@ def health() -> dict:
 
 
 @app.post("/analyze-incident", response_model=IncidentRecord)
-async def analyze_incident_endpoint(
-    entry: RawLogEntry, session: AsyncSession = Depends(get_session)
-) -> IncidentRecord:
+async def analyze_incident_endpoint(entry: RawLogEntry,
+                                    background_tasks: BackgroundTasks,
+                                    session: AsyncSession = Depends(get_session),
+                                    llm_runs: AsyncCollection = Depends(get_llm_runs)) -> IncidentRecord:
     normalized_text = normalize_raw_text(entry.raw_text)
     if not normalized_text:
         raise HTTPException(status_code=400, detail="raw_text has no usable content")
@@ -65,8 +87,11 @@ async def analyze_incident_endpoint(
         return incident_record
 
     try:
-        analysis, latency_ms, retry_count = await run_in_threadpool(
-            analyze_incident, entry.service, entry.environment, normalized_text
+        # .value, not the enum: since Python 3.12 an f-string renders a
+        # (str, Enum) member as "Environment.PROD", which is what the prompt
+        # used to receive (caught by reading a trace in llm_runs).
+        analysis, llm_run = await run_in_threadpool(
+            analyze_incident, entry.service, entry.environment.value, normalized_text
         )
     except LLMResponseError as e:
         # Kept as a safety net, though analyze_incident now absorbs malformed
@@ -86,9 +111,22 @@ async def analyze_incident_endpoint(
         priority_reasoning=analysis.priority_reasoning,
         confidence=analysis.confidence,
         needs_human_review=analysis.needs_human_review,
-        llm_latency_ms=latency_ms,
-        llm_retry_count=retry_count,
+        llm_latency_ms=llm_run.latency_ms,
+        llm_retry_count=llm_run.retry_count,
     )
+
+    # After the Postgres insert, so the trace can point at the incident. There
+    # is no transaction spanning both databases: if this write fails, the
+    # incident simply has no trace - the reverse (a trace pointing at an
+    # incident that was never saved) would be worse.
+    background_tasks.add_task(save_llm_run,
+                              llm_runs,
+                              llm_run,
+                              source="api",
+                              incident_id=incident.id,
+                              error_hash=error_hash,
+                              service=entry.service,
+                              environment=entry.environment.value)
 
     return IncidentRecord(
         id=incident.id,

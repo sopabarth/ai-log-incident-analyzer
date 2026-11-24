@@ -45,6 +45,10 @@ rather than a callable to invoke - see its docstring for why):
     guaranteed-to-fail auth error just burns time, and silently returning
     "unknown incident" for a broken deployment would hide an ops problem
     that needs to be loud, not classified.
+
+Every attempt is recorded as it happens (status, error, latency, raw model
+response), so analyze_incident() returns, next to the analysis, an LLMRun
+trace of everything that went into it - see app/llm_trace.py.
 """
 
 import json
@@ -62,6 +66,7 @@ from groq import (
 )
 from pydantic import BaseModel, ValidationError
 
+from app.llm_trace import AttemptStatus, AttemptTrace, LLMRun, StepTrace, prompt_fingerprint
 from app.schemas import ClassificationResult, ErrorCategory, IncidentAnalysis, Priority, PriorityResult
 
 load_dotenv()
@@ -79,6 +84,10 @@ _T = TypeVar("_T", bound=BaseModel)
 class LLMResponseError(Exception):
     """Raised when a single attempt's response can't be parsed into the expected model."""
 
+    def __init__(self, message: str, status: AttemptStatus):
+        super().__init__(message)
+        self.status = status
+
 
 def _get_client() -> Groq:
     global _client
@@ -92,17 +101,20 @@ def _get_client() -> Groq:
     return _client
 
 
-def analyze_incident(service: str, environment: str, normalized_text: str) -> tuple[IncidentAnalysis, int, int]:
-    """Dispatches to the decomposed or single-call pipeline per TASK_DECOMPOSITION."""
+def analyze_incident(service: str, environment: str, normalized_text: str) -> tuple[IncidentAnalysis, LLMRun]:
+    """
+    Dispatches to the decomposed or single-call pipeline per TASK_DECOMPOSITION.
+    Returns the analysis and the trace of the model calls behind it; total
+    latency and retry count are on the trace (run.latency_ms, run.retry_count).
+    """
     if TASK_DECOMPOSITION:
         return _analyze_decomposed(service, environment, normalized_text)
     return _analyze_single_call(service, environment, normalized_text)
 
 
-def _run_completion(system_prompt: str, user_prompt: str, response_model: type[_T]) -> _T:
-    """One unretried Groq round-trip, parsed into `response_model`. Raises
-    LLMResponseError on unusable output, or lets Groq API exceptions
-    (network/auth/rate-limit/...) propagate as-is."""
+def _run_completion(system_prompt: str, user_prompt: str) -> str:
+    """One unretried Groq round-trip, returning the model's raw text. Groq
+    API exceptions (network/auth/rate-limit/...) propagate as-is."""
     client = _get_client()
 
     response = client.chat.completions.create(
@@ -115,58 +127,98 @@ def _run_completion(system_prompt: str, user_prompt: str, response_model: type[_
         response_format={"type": "json_object"},
     )
 
-    content = response.choices[0].message.content
+    return response.choices[0].message.content or ""
 
+
+def _parse_response(content: str, response_model: type[_T]) -> _T:
+    """Parses the model's raw text into `response_model`, or raises
+    LLMResponseError saying what was wrong with it. The raw text itself is
+    not repeated in the message - the trace keeps it separately."""
     try:
         data = json.loads(content)
     except json.JSONDecodeError as e:
-        raise LLMResponseError(f"Model did not return valid JSON: {e}\nRaw: {content!r}") from e
+        raise LLMResponseError(f"invalid JSON: {e}", "invalid_json") from e
 
+    if not isinstance(data, dict):
+        raise LLMResponseError(f"expected a JSON object, got {type(data).__name__}", "validation_error")
     try:
         return response_model(**data)
     except ValidationError as e:
-        raise LLMResponseError(f"Model JSON failed schema validation: {e}\nRaw: {data!r}") from e
+        problems = "; ".join(f"{'.'.join(map(str, err['loc'])) or '<root>'}: {err['msg']}" for err in e.errors())
+        raise LLMResponseError(f"schema validation failed: {problems}", "validation_error") from e
+
+
+def _api_error_status(e: Exception) -> AttemptStatus:
+    # APITimeoutError subclasses APIConnectionError, so it's checked first.
+    if isinstance(e, RateLimitError):
+        return "rate_limited"
+    if isinstance(e, APITimeoutError):
+        return "timeout"
+    if isinstance(e, APIConnectionError):
+        return "connection_error"
+    return "server_error"
+
+
+def _elapsed_ms(since: float) -> int:
+    return int((time.monotonic() - since) * 1000)
 
 
 def _call_with_retry(step_name: str,
                      system_prompt: str,
                      user_prompt: str,
                      response_model: type[_T],
-                     fallback: _T, ) -> tuple[_T, int, int]:
+                     fallback: _T, ) -> tuple[_T, StepTrace]:
     """
     Shared retry loop for one pipeline step. Takes the plain ingredients
     for the Groq call (prompts + expected response type) and calls
     _run_completion() itself.
 
-    Returns (result, latency_ms, retry_count); returns `fallback` instead
-    if every attempt fails on a retryable error. See module docstring for
-    the full retry/fallback policy.
+    Returns (result, trace); the result is `fallback` instead if every
+    attempt fails on a retryable error. The trace records each attempt.
+    See module docstring for the full retry/fallback policy.
     """
-    started = time.monotonic()
+    trace = StepTrace(name=step_name,
+                      system_prompt_fingerprint=prompt_fingerprint(system_prompt),
+                      user_prompt=user_prompt)
+    step_started = time.monotonic()
     last_error: Exception | None = None
 
     for attempt in range(1, MAX_ATTEMPTS + 1):
+        attempt_started = time.monotonic()
+        content: str | None = None
         try:
-            result = _run_completion(system_prompt, user_prompt, response_model)
-            latency_ms = int((time.monotonic() - started) * 1000)
-            return result, latency_ms, attempt - 1
+            content = _run_completion(system_prompt, user_prompt)
+            result = _parse_response(content, response_model)
         except LLMResponseError as e:
             # Bad generation, not a timing issue - retry right away.
             last_error = e
-            print(f"[llm_client:{step_name}] attempt {attempt}/{MAX_ATTEMPTS} failed (malformed output): {e}")
+            trace.attempts.append(AttemptTrace(n=attempt, status=e.status, latency_ms=_elapsed_ms(attempt_started),
+                                               error=str(e), raw_response=content))
+            print(f"[llm_client:{step_name}] attempt {attempt}/{MAX_ATTEMPTS} failed ({e.status}): {e}")
         except _RETRYABLE_API_ERRORS as e:
             # Transient infra issue - back off a bit before hammering again.
             last_error = e
-            print(f"[llm_client:{step_name}] attempt {attempt}/{MAX_ATTEMPTS} failed ({type(e).__name__}): {e}")
+            status = _api_error_status(e)
+            trace.attempts.append(AttemptTrace(n=attempt, status=status, latency_ms=_elapsed_ms(attempt_started),
+                                               error=f"{type(e).__name__}: {e}"))
+            print(f"[llm_client:{step_name}] attempt {attempt}/{MAX_ATTEMPTS} failed ({status}): {e}")
             if attempt < MAX_ATTEMPTS:
                 time.sleep(RETRY_BACKOFF_SECONDS * attempt)
+        else:
+            trace.attempts.append(AttemptTrace(n=attempt, status="ok", latency_ms=_elapsed_ms(attempt_started),
+                                               raw_response=content))
+            trace.result = result.model_dump(mode="json")
+            trace.latency_ms = _elapsed_ms(step_started)
+            return result, trace
 
     # Exhausted every attempt on retryable failures only - fall back instead
     # of failing the request outright. print() is a placeholder here; proper
     # structured logging is its own later step.
     print(f"[llm_client:{step_name}] all {MAX_ATTEMPTS} attempts failed, falling back. Last error: {last_error}")
-    latency_ms = int((time.monotonic() - started) * 1000)
-    return fallback, latency_ms, MAX_ATTEMPTS - 1
+    trace.result = fallback.model_dump(mode="json")
+    trace.fell_back = True
+    trace.latency_ms = _elapsed_ms(step_started)
+    return fallback, trace
 
 
 # --- Single-call mode (TASK_DECOMPOSITION=false) ---
@@ -199,14 +251,15 @@ Return ONLY the JSON object, no markdown fences, no commentary.
 """
 
 
-def _analyze_single_call(service: str, environment: str, normalized_text: str) -> tuple[IncidentAnalysis, int, int]:
+def _analyze_single_call(service: str, environment: str, normalized_text: str) -> tuple[IncidentAnalysis, LLMRun]:
     # Same user prompt shape as _classify - both just need service/environment/error.
     user_prompt = _build_classify_user_prompt(service, environment, normalized_text)
-    return _call_with_retry("analyze",
-                            _SINGLE_CALL_SYSTEM_PROMPT,
-                            user_prompt,
-                            IncidentAnalysis,
-                            _fallback_single_call_analysis())
+    analysis, step = _call_with_retry("analyze",
+                                      _SINGLE_CALL_SYSTEM_PROMPT,
+                                      user_prompt,
+                                      IncidentAnalysis,
+                                      _fallback_single_call_analysis())
+    return analysis, LLMRun(mode="single", model=GROQ_MODEL, steps=[step])
 
 
 def _fallback_single_call_analysis() -> IncidentAnalysis:
@@ -221,20 +274,20 @@ def _fallback_single_call_analysis() -> IncidentAnalysis:
 
 # --- Task decomposition mode (TASK_DECOMPOSITION=true) ---
 
-def _analyze_decomposed(service: str, environment: str, normalized_text: str) -> tuple[IncidentAnalysis, int, int]:
+def _analyze_decomposed(service: str, environment: str, normalized_text: str) -> tuple[IncidentAnalysis, LLMRun]:
     """
     Runs the classify -> prioritize pipeline (each step independently
     retried/falls back - see module docstring) and merges the results into
     the IncidentAnalysis shape the rest of the app already expects.
 
-    Returns (analysis, total_latency_ms, total_retry_count) - latency and
-    retry count are summed across both steps.
+    Returns (analysis, trace) - the trace has one step per call, and its
+    latency and retry count are summed across both.
     """
-    classification, classify_latency_ms, classify_retries = _classify(service, environment, normalized_text)
-    priority_result, prioritize_latency_ms, prioritize_retries = _prioritize(service,
-                                                                             environment,
-                                                                             normalized_text,
-                                                                             classification.category)
+    classification, classify_step = _classify(service, environment, normalized_text)
+    priority_result, prioritize_step = _prioritize(service,
+                                                   environment,
+                                                   normalized_text,
+                                                   classification.category)
 
     analysis = IncidentAnalysis(category=classification.category,
                                 root_cause_summary=classification.root_cause_summary,
@@ -242,9 +295,7 @@ def _analyze_decomposed(service: str, environment: str, normalized_text: str) ->
                                 priority_reasoning=priority_result.priority_reasoning,
                                 confidence=classification.confidence,
                                 needs_human_review=classification.needs_human_review)
-    total_latency_ms = classify_latency_ms + prioritize_latency_ms
-    total_retry_count = classify_retries + prioritize_retries
-    return analysis, total_latency_ms, total_retry_count
+    return analysis, LLMRun(mode="decomposed", model=GROQ_MODEL, steps=[classify_step, prioritize_step])
 
 
 # --- Step 1: classification ---
@@ -273,7 +324,7 @@ def _build_classify_user_prompt(service: str, environment: str, normalized_text:
             f"error:\n{normalized_text}")
 
 
-def _classify(service: str, environment: str, normalized_text: str) -> tuple[ClassificationResult, int, int]:
+def _classify(service: str, environment: str, normalized_text: str) -> tuple[ClassificationResult, StepTrace]:
     user_prompt = _build_classify_user_prompt(service, environment, normalized_text)
     return _call_with_retry("classify",
                             _CLASSIFY_SYSTEM_PROMPT,
@@ -323,7 +374,7 @@ def _build_prioritize_user_prompt(service: str, environment: str, normalized_tex
 def _prioritize(service: str,
                 environment: str,
                 normalized_text: str,
-                category: ErrorCategory) -> tuple[PriorityResult, int, int]:
+                category: ErrorCategory) -> tuple[PriorityResult, StepTrace]:
     user_prompt = _build_prioritize_user_prompt(service, environment, normalized_text, category)
     return _call_with_retry("prioritize",
                             _PRIORITIZE_SYSTEM_PROMPT,

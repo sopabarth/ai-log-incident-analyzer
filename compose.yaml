@@ -15,12 +15,33 @@ services:
       timeout: 3s
       retries: 5
 
+  # LLM call traces (see app/mongo.py). Same root/root credentials as the
+  # Postgres service, for local development only.
+  mongo:
+    image: mongo:8
+    environment:
+      MONGO_INITDB_ROOT_USERNAME: root
+      MONGO_INITDB_ROOT_PASSWORD: root
+    ports:
+      - "27017:27017"
+    volumes:
+      - mongodata:/data/db
+    healthcheck:
+      test: [ "CMD", "mongosh", "--quiet", "--eval", "db.adminCommand('ping').ok" ]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
   app:
     build:
       context: .
       dockerfile: Dockerfile.uv
     depends_on:
       db:
+        condition: service_healthy
+      # The app works without Mongo (trace writes are best effort), but
+      # starting in order avoids a burst of failed writes right at startup.
+      mongo:
         condition: service_healthy
     env_file:
       - .env
@@ -29,8 +50,10 @@ services:
       # the app directly on the host) - inside the compose network, Postgres
       # is reachable at the "db" service name instead.
       DATABASE_URL: postgresql+asyncpg://root:root@db:5432/incident_analyzer
+      MONGO_URL: mongodb://root:root@mongo:27017/
     ports:
       - "8000:8000"
 
 volumes:
   pgdata:
+  mongodata:

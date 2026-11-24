@@ -3,6 +3,7 @@ asyncpg==0.31.0
 fastapi[standard]==0.141.1
 groq==1.7.0
 pydantic==2.13.5
+pymongo==4.20.1
 python-dotenv==1.2.3
 sqlalchemy[asyncio]==2.0.52
 uvicorn[standard]==0.52.4
